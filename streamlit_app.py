@@ -15,13 +15,17 @@ import streamlit as st
 
 # ---- Import your existing backend without altering it ----
 from rag_DO import (
-        chat,                 # function(message: str, history) -> str
-        summary,              # ingestion summary dict
-        USAGE_TOTALS,         # defaultdict with pricing/usage totals
+        chat,
+        summary,
+        USAGE_TOTALS,
         SESSION_ID, 
-        reset_history                    # active session id string
+        reset_history, 
+        incremental_ingest,
+        embeddings,
+        COLLECTION
     )
 
+#from rag_DO import incremental_ingest, embeddings, COLLECTION
 
 # ------------------------- Page config -------------------------
 st.set_page_config(
@@ -79,6 +83,19 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 # ------------------------- Sidebar ----------------------------
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+if "last_upload_files" not in st.session_state:
+    st.session_state.last_upload_files = []
+if "last_skipped_files" not in st.session_state:
+    st.session_state.last_skipped_files = []
+if "last_ingest_changed" not in st.session_state:
+    st.session_state.last_ingest_changed = []
+if "last_ingest_failed" not in st.session_state:
+    st.session_state.last_ingest_failed = []
+
+
+
 with st.sidebar:
     st.image("LogoAI2.png", width=200)
     #st.header("⚙️ Settings")
@@ -91,27 +108,35 @@ with st.sidebar:
         "Drop files to ingest",
         type=["pdf", "docx", "txt", "csv", "xlsx", "xls", "pptx", "ppt"],
         accept_multiple_files=True,
+        key=f"uploader_{st.session_state.uploader_key}",
     )
 
+    # --- Handle newly uploaded files (this run) ---
     if uploaded_files:
         os.makedirs("data", exist_ok=True)  # BASE_DIR
 
         saved_files = []
+        skipped_files = []
+
         for f in uploaded_files:
+            # Simple check: empty file
+            if f.size == 0:
+                skipped_files.append(f.name)
+                continue
+
             save_path = os.path.join("data", f.name)
             with open(save_path, "wb") as out:
                 out.write(f.read())
             saved_files.append(f.name)
 
-        st.success(f"Uploaded {len(saved_files)} file(s): {', '.join(saved_files)}")
+        # Store in session so messages survive rerun
+        st.session_state.last_upload_files = saved_files
+        st.session_state.last_skipped_files = skipped_files
 
-        # Show a re-ingest button ONLY when files were uploaded
-        if st.button("🔄 Re-ingest uploaded documents"):
+        # Show ingest button only when we have something to ingest
+        if saved_files and st.button("🔄 Uploaded documents"):
             try:
                 with st.spinner("Re-ingesting documents… please wait"):
-                    from rag_DO import incremental_ingest, embeddings, COLLECTION
-
-                    # Re-run ingestion ON DEMAND
                     vectorstore, BM25_CORPUS, summary = incremental_ingest(
                         base_dir="data",
                         collection_name=COLLECTION,
@@ -119,11 +144,60 @@ with st.sidebar:
                         dry_run=False,
                     )
 
-                st.success("Re-ingestion complete! New documents are now searchable.")
+                changed_files = [os.path.basename(p) for p in summary.get("changed", [])]
+                failed_files = [os.path.basename(p) for p in summary.get("failed", [])]
+
+                # Save ingest results in session state so we can show messages after rerun
+                changed_files = [os.path.basename(p) for p in summary.get("changed", [])]
+                failed_files = [os.path.basename(p) for p in summary.get("failed", [])]
+
+                # Save ingest results in session state so we can show messages after rerun
+                st.session_state.last_ingest_changed = changed_files
+                st.session_state.last_ingest_failed = failed_files
+
+                # ✅ Update the "uploaded" summary to only show successfully indexed files
+                if changed_files:
+                    st.session_state.last_upload_files = changed_files
+                else:
+                    # if nothing was indexed successfully, clear the success banner
+                    st.session_state.last_upload_files = []
+
+                # Reset uploader so file list disappears, then rerun
+                st.session_state.uploader_key += 1
+                st.rerun()
+
 
             except Exception as e:
                 st.error("Error during re-ingestion")
                 st.exception(e)
+
+    # --- Persistent messages (shown even after uploader reset) ---
+    if st.session_state.last_upload_files:
+        st.success(
+            f"Uploaded {len(st.session_state.last_upload_files)} file(s): "
+            + ", ".join(st.session_state.last_upload_files)
+        )
+
+
+    if st.session_state.last_skipped_files:
+        st.warning(
+            "Skipped empty file(s): "
+            + ", ".join(st.session_state.last_skipped_files)
+        )
+
+    if st.session_state.last_ingest_changed:
+        st.info(
+            "Re-ingestion complete! Updated/added "
+            f"{len(st.session_state.last_ingest_changed)} file(s): "
+            + ", ".join(st.session_state.last_ingest_changed)
+        )
+
+    if st.session_state.last_ingest_failed:
+        st.warning(
+            "The following file(s) failed to index and were removed:\n\n"
+            + ", ".join(st.session_state.last_ingest_failed)
+        )
+
 
     st.divider()
 

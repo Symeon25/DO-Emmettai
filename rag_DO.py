@@ -93,6 +93,18 @@ vectorstore = PGVector(
 
 BM25_CORPUS: List[Document] = []
 
+summary = {
+    "changed": [],
+    "deleted": [],
+    "skipped": [],
+    "total_in_db": None,
+    "embedding_usage": {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "total_cost": 0.0,
+    },
+}
 
 def make_pg_vectorstore():
     return PGVector(
@@ -440,6 +452,43 @@ OLD
     return splitter.split_documents(docs)
 """
 
+def _sanitize_str(s) -> str:
+    """
+    Make sure a value is safe to send to PostgreSQL/UTF-8:
+    - Cast non-strings to str
+    - Remove NUL bytes (0x00) which Postgres text cannot store
+    - Optionally strip other nasty control chars
+    """
+    if s is None:
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+
+    # 1) Remove NUL bytes explicitly
+    s = s.replace("\x00", "")
+
+    # 2) (Optional but helpful) drop other control chars except newline/tab
+    #    This keeps normal text and all non-ASCII, but removes weird control junk.
+    s = "".join(ch for ch in s if ch >= " " or ch in "\n\r\t")
+
+    # 3) Deal with any remaining surrogate / invalid sequences
+    return s.encode("utf-8", "replace").decode("utf-8", "replace")
+
+
+
+def _clean_metadata(md: dict) -> dict:
+    clean = {}
+    for k, v in (md or {}).items():
+        # Clean keys and string values
+        ck = _sanitize_str(k)
+        if isinstance(v, str):
+            clean[ck] = _sanitize_str(v)
+        else:
+            clean[ck] = v
+    return clean
+
+
+
 # -------------- Ingestion --------------
 
 def incremental_ingest(base_dir: str, collection_name: str, embeddings, dry_run: bool = False):
@@ -455,7 +504,7 @@ def incremental_ingest(base_dir: str, collection_name: str, embeddings, dry_run:
     manifest = load_manifest(".")  # manifest file will live next to app; change path if you prefer
     current_files = scan_files(base_dir)
 
-    changed, deleted, skipped = [], [], []
+    changed, deleted, skipped, failed = [], [], [], []
     current_hashes = {}
     for p in current_files:
         try:
@@ -500,34 +549,74 @@ def incremental_ingest(base_dir: str, collection_name: str, embeddings, dry_run:
             continue
 
         # remove old chunks for this file before re-adding
+            # remove old chunks for this file before re-adding
         try:
             vectordb.delete(filter={"source": p})
         except Exception as e:
             print(f"[WARN] delete failed for {p}: {e}")
 
-        loader = pick_loader(p)
-        file_docs = loader.load()
+        # Safely load the file; skip if it's empty/corrupt
+        try:
+            loader = pick_loader(p)
+            file_docs = loader.load()
+        except Exception as e:
+            print(f"[WARN] Skipping file due to load error: {p} ({e})")
+            failed.append(p)
+
+            # Remove the bad file from the ingest folder
+            try:
+                os.remove(p)
+                print(f"[INFO] Removed failed file from ingest folder: {p}")
+            except Exception as e_rm:
+                print(f"[WARN] Could not remove failed file {p}: {e_rm}")
+            continue
+
+
         for d in file_docs:
             d.metadata["source"] = p
             d.metadata["file_hash"] = h
 
+
         chunks = split_docs(file_docs)
+
+        if not chunks:
+            print(f"[WARN] No readable chunks produced for file: {p}. Skipping.")
+            failed.append(p)
+            try:
+                os.remove(p)
+                print(f"[INFO] Removed failed file from ingest folder: {p}")
+            except Exception as e_rm:
+                print(f"[WARN] Could not remove failed file {p}: {e_rm}")
+            continue
+
         bm25_corpus_local.extend(chunks)
 
-        texts = [c.page_content for c in chunks]
+        # Clean ALL strings before sending to Postgres
+        texts = [_sanitize_str(c.page_content) for c in chunks]
         metadatas = []
         ids = []
+
         for i, c in enumerate(chunks):
             md = dict(c.metadata or {})
             md["chunk_id"] = i
             md["doc_id"] = f"{p}:::{i}"
-            metadatas.append(md)
-            ids.append(md["doc_id"])
 
-        # This will call OpenAIEmbeddings under the hood; the callback captures token usage
+            md = _clean_metadata(md)  # clean metadata keys/values
+            metadatas.append(md)
+
+            ids.append(_sanitize_str(md["doc_id"]))  # clean id string too
+
+        # Extra safety: if somehow there are no texts/ids, don't call add_texts
+        if not texts or not ids:
+            print(f"[WARN] No non-empty texts/ids for file: {p}. Skipping DB insert.")
+            skipped.append(p)
+            continue
+
         from langchain_community.callbacks import get_openai_callback
         with get_openai_callback() as cb:
             vectordb.add_texts(texts=texts, metadatas=metadatas, ids=ids)
+
+
 
         emb_tokens = getattr(cb, "total_embedding_tokens", 0) or getattr(cb, "total_tokens", 0)
         if emb_tokens == 0:
@@ -555,6 +644,7 @@ def incremental_ingest(base_dir: str, collection_name: str, embeddings, dry_run:
         "changed": changed,
         "deleted": deleted,
         "skipped": skipped,
+        "failed": failed,
         "total_in_db": total_rows,
         "embedding_usage": embed_usage,
     }
@@ -562,24 +652,27 @@ def incremental_ingest(base_dir: str, collection_name: str, embeddings, dry_run:
 
 
 # ---- Run ingestion once on startup ----
-vectorstore, BM25_CORPUS, summary = incremental_ingest(
-    base_dir=BASE_DIR,
-    collection_name=COLLECTION,
-    embeddings=embeddings,
-    dry_run=False,
-)
+RUN_STARTUP_INGEST = os.getenv("RUN_STARTUP_INGEST", "false").lower() == "true"
 
+if RUN_STARTUP_INGEST:
+    vectorstore, BM25_CORPUS, summary = incremental_ingest(
+        base_dir=BASE_DIR,
+        collection_name=COLLECTION,
+        embeddings=embeddings,
+        dry_run=False,
+    )
 
-u = summary["embedding_usage"]
-print(
-    f"\nIngest summary:\n"
-    f"  Added/Updated files: {len(summary['changed'])}\n"
-    f"  Deleted files: {len(summary['deleted'])}\n"
-    f"  Unchanged files: {len(summary['skipped'])}\n"
-    f"  Total chunks in DB: {summary['total_in_db']}\n"
-    f"  Embedding tokens this run: {u['total_tokens']} (cost ${u['total_cost']:.6f})\n"
-)
-
+    u = summary["embedding_usage"]
+    print(
+        f"\nIngest summary:\n"
+        f"  Added/Updated files: {len(summary['changed'])}\n"
+        f"  Deleted files: {len(summary['deleted'])}\n"
+        f"  Unchanged files: {summary['skipped']}\n"
+        f"  Total chunks in DB: {summary['total_in_db']}\n"
+        f"  Embedding tokens this run: {u['total_tokens']} (cost ${u['total_cost']:.6f})\n"
+    )
+else:
+    print("Skipping startup ingestion; using existing PGVector collection only.")
 # -------------- RAG Chain --------------
 
 # ---- Keep your rrf_fuse exactly as you wrote it ----
@@ -598,14 +691,35 @@ def rrf_fuse(result_lists, weights=None, k=TOP_K, c=60, id_key="doc_id"):
 
 # after incremental_ingest() returns:
 
-bm25 = BM25Retriever.from_documents(BM25_CORPUS, k=TOP_K)
+#bm25 = BM25Retriever.from_documents(BM25_CORPUS, k=TOP_K)
+#dense = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": TOP_K, "fetch_k": 20, "lambda_mult": 0.7})
 
-# (optional) ensemble:
-#from langchain_community.retrievers  import EnsembleRetriever
-#dense = vectorstore.as_retriever(search_kwargs={"k": TOP_K})
-dense = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": TOP_K, "fetch_k": 20, "lambda_mult": 0.7})
-#retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": TOP_K, "fetch_k": 20, "lambda_mult": 0.7})
-#retriever = EnsembleRetriever(retrievers=[bm25, dense], weights=[0.4, 0.6])
+# after incremental_ingest() returns:
+
+# Dense retriever (works even if there are no docs yet, it will just return empty)
+dense = vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": TOP_K, "fetch_k": 20, "lambda_mult": 0.7},
+)
+
+# BM25 retriever – only build if we actually have documents
+if BM25_CORPUS:
+    bm25 = BM25Retriever.from_documents(BM25_CORPUS, k=TOP_K)
+else:
+    print("BM25_CORPUS is empty; BM25 disabled until ingestion runs. Using dense-only retriever.")
+
+    class DenseOnlyBM25:
+        def __init__(self, dense_ret):
+            self.dense = dense_ret
+
+        def invoke(self, query: str):
+            return self.dense.invoke(query)
+
+        def get_relevant_documents(self, query: str):
+            return self.dense.get_relevant_documents(query)
+
+    bm25 = DenseOnlyBM25(dense)
+
 
 # ---- Minimal adapter so hybrid behaves like a retriever ----
 class HybridRRFRetriever:
