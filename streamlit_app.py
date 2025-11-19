@@ -1,32 +1,28 @@
-"""
-Streamlit front‑end for the RAG system in `test_better.py`.
-
-Usage:
-    streamlit run ui_streamlit.py
-
-This file does NOT modify any logic in `test_better.py`. It only imports it
-and provides a simple chat UI, plus a sidebar with ingestion + cost stats.
-"""
-
 import os
 import time
 import traceback
 import streamlit as st
 
 # ---- Import your existing backend without altering it ----
-from rag_DO import (
-        chat,
-        summary,
-        USAGE_TOTALS,
-        SESSION_ID, 
-        reset_history, 
-        incremental_ingest,
+from vector_chat import (
+    chat,
+    USAGE_TOTALS,
+    SESSION_ID,
+    reset_history,
+)
+
+from vector_store import (
+        add_chunks_to_vectorstore,
         embeddings,
+        split_docs,
         COLLECTION
     )
 
-#from rag_DO import incremental_ingest, embeddings, COLLECTION
-
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    Docx2txtLoader,
+    TextLoader,
+)
 # ------------------------- Page config -------------------------
 st.set_page_config(
     page_title="EMMETT.ai",
@@ -102,7 +98,7 @@ with st.sidebar:
 
     #st.subheader("Session")
     #st.text_input("Session ID (from backend)", value=str(SESSION_ID), disabled=True)
-    st.subheader("📁 Upload documents")
+    st.subheader("📁 Add documents")
 
     uploaded_files = st.file_uploader(
         "Drop files to ingest",
@@ -134,22 +130,56 @@ with st.sidebar:
         st.session_state.last_skipped_files = skipped_files
 
         # Show ingest button only when we have something to ingest
-        if saved_files and st.button("🔄 Uploaded documents"):
+        if saved_files and st.button("🔄 Upload documents"):
+            changed_files = []
+            failed_files = []
+
             try:
-                with st.spinner("Re-ingesting documents… please wait"):
-                    vectorstore, BM25_CORPUS, summary = incremental_ingest(
-                        base_dir="data",
-                        collection_name=COLLECTION,
-                        embeddings=embeddings,
-                        dry_run=False,
-                    )
+                with st.spinner("Indexing documents into the vector store…"):
+                    all_docs = []
 
-                changed_files = [os.path.basename(p) for p in summary.get("changed", [])]
-                failed_files = [os.path.basename(p) for p in summary.get("failed", [])]
+                    # 1) Load each saved file into Documents
+                    for fname in saved_files:
+                        path = os.path.join("data", fname)
+                        ext = os.path.splitext(path)[1].lower()
 
-                # Save ingest results in session state so we can show messages after rerun
-                changed_files = [os.path.basename(p) for p in summary.get("changed", [])]
-                failed_files = [os.path.basename(p) for p in summary.get("failed", [])]
+                        try:
+                            if ext == ".pdf":
+                                loader = PyPDFLoader(path)
+                            elif ext == ".docx":
+                                loader = Docx2txtLoader(path)
+                            elif ext == ".txt":
+                                loader = TextLoader(path, autodetect_encoding=True)
+                            else:
+                                # You can extend this for csv/xlsx/xls/pptx/ppt if you want
+                                failed_files.append(fname)
+                                continue
+
+                            docs = loader.load()
+                            for d in docs:
+                                d.metadata["filename"] = fname      # uploaded file name
+                                d.metadata["source"] = path         # optional but useful
+
+                            all_docs.extend(docs)
+
+                            changed_files.append(fname)
+
+                        except Exception as e:
+                            failed_files.append(fname)
+                            print(f"[WARN] Failed to load {path}: {e}")
+
+                    # 2) Split into chunks
+                    if all_docs:
+                        chunks = split_docs(all_docs)
+
+                        # 3) Add chunks directly to PGVector
+                        usage = add_chunks_to_vectorstore(chunks)
+
+                        print(
+                            f"Indexed files: {', '.join(changed_files)} | "
+                            f"Embedded {usage['total_tokens']} tokens (cost ≈ ${usage['total_cost']:.6f})"
+                        )
+
 
                 # Save ingest results in session state so we can show messages after rerun
                 st.session_state.last_ingest_changed = changed_files
@@ -159,17 +189,16 @@ with st.sidebar:
                 if changed_files:
                     st.session_state.last_upload_files = changed_files
                 else:
-                    # if nothing was indexed successfully, clear the success banner
                     st.session_state.last_upload_files = []
 
                 # Reset uploader so file list disappears, then rerun
                 st.session_state.uploader_key += 1
                 st.rerun()
 
-
             except Exception as e:
-                st.error("Error during re-ingestion")
+                st.error("Error during ingestion")
                 st.exception(e)
+
 
     # --- Persistent messages (shown even after uploader reset) ---
     if st.session_state.last_upload_files:
@@ -187,14 +216,14 @@ with st.sidebar:
 
     if st.session_state.last_ingest_changed:
         st.info(
-            "Re-ingestion complete! Updated/added "
+            "Upload complete!"
             f"{len(st.session_state.last_ingest_changed)} file(s): "
             + ", ".join(st.session_state.last_ingest_changed)
         )
 
     if st.session_state.last_ingest_failed:
         st.warning(
-            "The following file(s) failed to index and were removed:\n\n"
+            "The following file(s) failed and were removed:\n\n"
             + ", ".join(st.session_state.last_ingest_failed)
         )
 
@@ -203,13 +232,13 @@ with st.sidebar:
 
     st.subheader("💬 Conversations")
 
-    st.markdown(f"**Current conversation ID:** `{st.session_state.session_id}`")
+    #st.markdown(f"**Current conversation ID:** `{st.session_state.session_id}`")
 
     # Show past conversations with ability to "see" and "load" them
     if st.session_state.past_conversations:
         st.markdown("**Past conversations:**")
         for conv in st.session_state.past_conversations:
-            with st.expander(f"{conv['title']}  (`{conv['id']}`)"):
+            with st.expander(f"{conv['title']}"):
                 # Show messages from that past conversation
                 for m in conv["messages"]:
                     role_label = "👤 User" if m["role"] == "user" else "🤖 Assistant"
