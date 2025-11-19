@@ -12,14 +12,12 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_openai import ChatOpenAI
-from langchain_community.retrievers import BM25Retriever
 from langchain_community.callbacks import get_openai_callback
 from langchain_core.tools import tool
 
 # 👉 our own vector / embeddings backend
 from vector_store import (
     vectorstore,       # PGVector instance
-    BM25_CORPUS,       # in-memory docs for BM25
     MODEL,             # chat model name ("gpt-4o-mini", etc.)
     compute_cost,      # cost calculator
 )
@@ -28,86 +26,12 @@ from vector_store import (
 
 TOP_K = int(os.getenv("TOP_K", "5"))
 
-# ----------------- RRF fusion -----------------
+# ----------------- Retrievers: Dense + LLM Reranker -----------------
 
-def rrf_fuse(result_lists, weights=None, k=TOP_K, c=60, id_key="doc_id"):
-    """
-    Reciprocal Rank Fusion to combine multiple ranked lists (bm25 + dense).
-    """
-    weights = weights or [1.0] * len(result_lists)
-    scores, by_id = {}, {}
-    for i, docs in enumerate(result_lists):
-        w = weights[i]
-        for rank, d in enumerate(docs):
-            did = (d.metadata or {}).get(id_key) or d.page_content
-            by_id[did] = d
-            scores[did] = scores.get(did, 0.0) + w * (1.0 / (c + rank + 1))
-    return [
-        by_id[did]
-        for did, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
-    ]
-
-# ----------------- Retrievers: dense + BM25 + hybrid -----------------
-
-# Dense retriever (PGVector)
 dense = vectorstore.as_retriever(
     search_type="mmr",
-    search_kwargs={"k": TOP_K, "fetch_k": 20, "lambda_mult": 0.7},
+    search_kwargs={"k": 20, "fetch_k": 40, "lambda_mult": 0.7},
 )
-
-# BM25 retriever – only build if we actually have documents
-if BM25_CORPUS:
-    bm25 = BM25Retriever.from_documents(BM25_CORPUS, k=TOP_K)
-else:
-    print("BM25_CORPUS is empty; BM25 disabled until ingestion runs. Using dense-only retriever.")
-
-    class DenseOnlyBM25:
-        def __init__(self, dense_ret):
-            self.dense = dense_ret
-
-        def invoke(self, query: str):
-            return self.dense.invoke(query)
-
-        def get_relevant_documents(self, query: str):
-            return self.dense.get_relevant_documents(query)
-
-    bm25 = DenseOnlyBM25(dense)
-
-
-class HybridRRFRetriever:
-    """
-    Hybrid retriever that fuses BM25 and dense (PGVector) results with RRF.
-    """
-    def __init__(self, bm25_ret, dense_ret, weights=(0.4, 0.6), k=TOP_K, c=60, id_key="doc_id"):
-        self.bm25 = bm25_ret
-        self.dense = dense_ret
-        self.weights = list(weights)
-        self.k = k
-        self.c = c
-        self.id_key = id_key
-
-    def _retrieve(self, query: str):
-        bm25_docs  = self.bm25.invoke(query)
-        dense_docs = self.dense.invoke(query)
-        return rrf_fuse(
-            [bm25_docs, dense_docs],
-            weights=self.weights,
-            k=self.k,
-            c=self.c,
-            id_key=self.id_key,
-        )
-
-    def invoke(self, query: str, **kwargs):
-        return self._retrieve(query)
-
-    def get_relevant_documents(self, query: str):
-        return self._retrieve(query)
-
-
-# Instantiate the hybrid retriever
-hybrid = HybridRRFRetriever(bm25, dense, weights=(0.4, 0.6), k=TOP_K, c=60, id_key="doc_id")
-
-# ----------------- LLM + prompts -----------------
 
 llm = ChatOpenAI(
     temperature=0.0,
@@ -116,6 +40,60 @@ llm = ChatOpenAI(
     streaming=True,
     stream_usage=True,
 )
+
+def rerank_with_llm(question: str, docs):
+    """
+    Rerank retrieved chunks using an LLM.
+    """
+    if not docs:
+        return []
+
+    context_block = "\n\n---\n\n".join(
+        f"[Doc {i}]\n{d.page_content}" for i, d in enumerate(docs)
+    )
+
+    prompt = f"""
+You are a retrieval reranker.
+
+User question:
+{question}
+
+Here are candidate document chunks:
+
+{context_block}
+
+Return the indices (comma-separated) of the TOP 5 most relevant [Doc i] chunks.
+Only return the indices, e.g.: 0,2,3,5,6
+"""
+
+    raw = llm.invoke(prompt).content.strip()
+
+    indices = []
+    for part in raw.replace(" ", "").split(","):
+        if part.isdigit():
+            idx = int(part)
+            if 0 <= idx < len(docs):
+                indices.append(idx)
+
+    if not indices:
+        return docs[: min(5, len(docs))]
+
+    return [docs[i] for i in indices]
+
+
+def dense_with_rerank(query: str):
+    retrieved = dense.invoke(query)   # <-- FIXED
+    top_docs = rerank_with_llm(query, retrieved)
+    return top_docs
+
+
+
+# This is what the RAG chain uses:
+retriever_runnable = RunnableLambda(lambda q: dense_with_rerank(q))
+
+
+
+# ----------------- LLM + prompts -----------------
 
 rewrite_prompt = ChatPromptTemplate.from_messages(
     [
@@ -141,24 +119,16 @@ def format_docs(docs):
         formatted.append(f"[Source: {filename}]\n{d.page_content}")
     return "\n\n---\n\n".join(formatted)
 
+"""
 prompt = ChatPromptTemplate.from_messages(
     [
-        (
-            "system",
-            "You write in a very detailed, elegant tone, formatting all answers in Markdown. "
-            "You are a helpful assistant. If the user expresses gratitude (e.g., 'thank you' or 'thanks'), "
-            "reply with a polite, friendly response (e.g., 'You're very welcome!'). "
-            "Otherwise, use ONLY the provided context to answer accurately and concisely. "
-            "Retrieve data only from the database and at the end of your answer, always append a tag "
-            "in the format: [File: <filenames>]. "
-            "If the question is not answerable from the database context, try to answer but mention "
-            "it is not from the database, then append [File: None]."
-        ),
+        ("system", "You are a helpful assistant. Use the provided context to answer accurately and concisely."),
         MessagesPlaceholder("chat_history"),
         ("system", "Context:\n{context}"),
         ("human", "{question}"),
     ]
 )
+"""
 
 contextualize_q_chain = rewrite_prompt | llm | StrOutputParser()
 
@@ -187,7 +157,7 @@ def maybe_rewrite(question, chat_history):
 
 # ----------------- RAG chain -----------------
 
-retriever_runnable = RunnableLambda(lambda q: hybrid.invoke(q))
+#retriever_runnable = RunnableLambda(lambda q: hybrid.invoke(q))
 format_runnable = RunnableLambda(format_docs)
 
 rag_chain = (
@@ -299,7 +269,7 @@ def rag_answer(question: str, session_id: str = SESSION_ID, top_k: int = TOP_K):
     chat_history = hist.messages if hist is not None else []
     standalone = maybe_rewrite(question, chat_history)
 
-    docs = hybrid.invoke(standalone)
+    docs = dense_with_rerank(standalone)
     context_text = format_docs(docs)
     final = (answer_prompt | llm | StrOutputParser()).invoke(
         {"context": context_text, "question": standalone}
@@ -340,4 +310,5 @@ def rag_lookup(question: str) -> str:
 
 
 __all__ = ["chat", "USAGE_TOTALS", "SESSION_ID", "reset_history", "rag_lookup", "rag_answer"]
+
 
