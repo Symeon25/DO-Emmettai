@@ -23,6 +23,18 @@ from langchain_community.document_loaders import (
     Docx2txtLoader,
     TextLoader,
 )
+
+import base64
+
+def load_logo_base64(path):
+    with open(path, "rb") as image_file:
+        encoded = base64.b64encode(image_file.read()).decode()
+        return f"data:image/png;base64,{encoded}"
+
+logo_data = load_logo_base64("logo/LogoAI2.png")
+
+
+
 # ------------------------- Page config -------------------------
 st.set_page_config(
     page_title="EMMETT.ai",
@@ -43,7 +55,12 @@ def require_login():
     if st.session_state.authed:
         return
 
-    st.image("LogoAI2.png", width=300)
+    #st.image("logo/LogoAI2.png", width=300)
+    st.markdown(
+    f"<img src='{logo_data}' style='width:300px;'>",
+    unsafe_allow_html=True
+    )
+
     st.markdown("### 🔒 Please log in to continue")
     with st.form("login-form", clear_on_submit=False):
         username = st.text_input("Username")
@@ -93,7 +110,12 @@ if "last_ingest_failed" not in st.session_state:
 
 
 with st.sidebar:
-    st.image("LogoAI2.png", width=200)
+    #st.image("logo/LogoAI2.png", width=200)
+    st.markdown(
+    f"<img src='{logo_data}' style='width:200px;'>",
+    unsafe_allow_html=True
+    )
+
     #st.header("⚙️ Settings")
 
     #st.subheader("Session")
@@ -237,15 +259,19 @@ with st.sidebar:
     # Show past conversations with ability to "see" and "load" them
     if st.session_state.past_conversations:
         st.markdown("**Past conversations:**")
-        for conv in st.session_state.past_conversations:
-            with st.expander(f"{conv['title']}"):
+        for idx, conv in enumerate(st.session_state.past_conversations):
+            # Give the expander a unique key as well (optional but safer)
+            with st.expander(f"{conv['title']}", expanded=False):
                 # Show messages from that past conversation
                 for m in conv["messages"]:
                     role_label = "👤 User" if m["role"] == "user" else "🤖 Assistant"
                     st.markdown(f"**{role_label}:** {m['content']}")
 
                 # 👉 Button to load this conversation as the active one
-                if st.button("Load this conversation", key=f"load_{conv['id']}"):
+                if st.button(
+                    "Load this conversation",
+                    key=f"load_{idx}_{conv['id']}",   # ✅ now guaranteed unique
+                ):
                     # 1. Switch current session_id to this past one
                     st.session_state.session_id = conv["id"]
 
@@ -256,6 +282,7 @@ with st.sidebar:
                     st.rerun()
     else:
         st.caption("No past conversations yet.")
+
 
     # Button to start a new conversation
     if st.button("➕ New conversation"):
@@ -303,8 +330,12 @@ with st.sidebar:
         st.info("Usage totals not available.")
 
 # ------------------------- Main area ---------------------------
-st.image("LogoAI2.png", width=300)
 
+#st.image("LogoAI2.png", width=300)
+st.markdown(
+    f"<img src='{logo_data}' style='width:300px;'>",
+    unsafe_allow_html=True
+    )
 # messages already initialized above, so no need to re-check here, but safe:
 if "messages" not in st.session_state:
     st.session_state.messages = []
