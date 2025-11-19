@@ -141,10 +141,19 @@ def format_docs(docs):
         formatted.append(f"[Source: {filename}]\n{d.page_content}")
     return "\n\n---\n\n".join(formatted)
 
-
 prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", "You are a helpful assistant. Use the provided context to answer accurately and concisely."),
+        (
+            "system",
+            "You write in a very detailed, elegant tone, formatting all answers in Markdown. "
+            "You are a helpful assistant. If the user expresses gratitude (e.g., 'thank you' or 'thanks'), "
+            "reply with a polite, friendly response (e.g., 'You're very welcome!'). "
+            "Otherwise, use ONLY the provided context to answer accurately and concisely. "
+            "Retrieve data only from the database and at the end of your answer, always append a tag "
+            "in the format: [File: <filenames>]. "
+            "If the question is not answerable from the database context, try to answer but mention "
+            "it is not from the database, then append [File: None]."
+        ),
         MessagesPlaceholder("chat_history"),
         ("system", "Context:\n{context}"),
         ("human", "{question}"),
@@ -331,3 +340,4 @@ def rag_lookup(question: str) -> str:
 
 
 __all__ = ["chat", "USAGE_TOTALS", "SESSION_ID", "reset_history", "rag_lookup", "rag_answer"]
+
