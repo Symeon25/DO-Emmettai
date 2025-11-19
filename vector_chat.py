@@ -41,9 +41,10 @@ llm = ChatOpenAI(
     stream_usage=True,
 )
 
-def rerank_with_llm(question: str, docs):
+
+def rerank_with_llm(question: str, docs, top_k: int = 5):
     """
-    Rerank retrieved chunks using an LLM.
+    Rerank retrieved chunks using an LLM and return up to `top_k` UNIQUE docs.
     """
     if not docs:
         return []
@@ -62,12 +63,13 @@ Here are candidate document chunks:
 
 {context_block}
 
-Return the indices (comma-separated) of the TOP 5 most relevant [Doc i] chunks.
+Return the indices (comma-separated) of the TOP {top_k} most relevant [Doc i] chunks.
 Only return the indices, e.g.: 0,2,3,5,6
 """
 
     raw = llm.invoke(prompt).content.strip()
 
+    # --- parse indices, dedupe, and cap to top_k ---
     indices = []
     for part in raw.replace(" ", "").split(","):
         if part.isdigit():
@@ -75,17 +77,27 @@ Only return the indices, e.g.: 0,2,3,5,6
             if 0 <= idx < len(docs):
                 indices.append(idx)
 
-    if not indices:
-        return docs[: min(5, len(docs))]
+    # Deduplicate while preserving order
+    seen = set()
+    unique_indices = []
+    for idx in indices:
+        if idx not in seen:
+            seen.add(idx)
+            unique_indices.append(idx)
 
-    return [docs[i] for i in indices]
+    # Enforce top_k cap
+    unique_indices = unique_indices[:top_k]
 
+    # Fallback if model output is unusable
+    if not unique_indices:
+        return docs[: min(top_k, len(docs))]
 
-def dense_with_rerank(query: str):
-    retrieved = dense.invoke(query)   # <-- FIXED
-    top_docs = rerank_with_llm(query, retrieved)
+    return [docs[i] for i in unique_indices]
+
+def dense_with_rerank(query: str, top_k: int = TOP_K):
+    retrieved = dense.invoke(query)   # 20 docs from MMR
+    top_docs = rerank_with_llm(query, retrieved, top_k=top_k)
     return top_docs
-
 
 
 # This is what the RAG chain uses:
@@ -269,7 +281,7 @@ def rag_answer(question: str, session_id: str = SESSION_ID, top_k: int = TOP_K):
     chat_history = hist.messages if hist is not None else []
     standalone = maybe_rewrite(question, chat_history)
 
-    docs = dense_with_rerank(standalone)
+    docs = dense_with_rerank(standalone,  top_k=top_k)
     context_text = format_docs(docs)
     final = (answer_prompt | llm | StrOutputParser()).invoke(
         {"context": context_text, "question": standalone}
@@ -289,7 +301,8 @@ def rag_answer(question: str, session_id: str = SESSION_ID, top_k: int = TOP_K):
             }
         )
 
-    confidence = min(1.0, len(docs) / 5.0)
+    confidence = min(1.0, len(docs) / float(top_k or 1))
+
 
     return {
         "answer": final,
