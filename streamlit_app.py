@@ -22,7 +22,12 @@ from langchain_community.document_loaders import (
     PyPDFLoader,
     Docx2txtLoader,
     TextLoader,
+    CSVLoader,                    
+    UnstructuredPowerPointLoader, 
+    UnstructuredExcelLoader, 
+    DataFrameLoader,     
 )
+import pandas as pd
 
 import base64
 
@@ -168,12 +173,43 @@ with st.sidebar:
                         try:
                             if ext == ".pdf":
                                 loader = PyPDFLoader(path)
+
                             elif ext == ".docx":
                                 loader = Docx2txtLoader(path)
+
                             elif ext == ".txt":
                                 loader = TextLoader(path, autodetect_encoding=True)
+
+                            # 🔢 CSV (one Document per row)
+
+                            elif ext == ".csv":
+                                # Use pandas to read CSV robustly
+                                df = pd.read_csv(path)          # add sep=";" here if needed
+                                df = df.fillna("")              # avoid NaN in text
+
+                                # 🔑 Make *all* columns plain Python strings (no numpy ints/floats)
+                                df = df.astype(str)
+
+                                # Now combine each row
+                                df["_combined"] = df.agg(" | ".join, axis=1)
+
+                                # Turn the DataFrame into LangChain Documents
+                                loader = DataFrameLoader(df, page_content_column="_combined")
+
+
+                            # 📊 Excel (xls/xlsx) via UnstructuredExcelLoader
+                            elif ext in [".xlsx", ".xls"]:
+                                df = pd.read_excel(path)
+                                df = df.fillna("").astype(str)
+                                df["_combined"] = df.agg(" | ".join, axis=1)
+                                loader = DataFrameLoader(df, page_content_column="_combined")
+
+                            # 📽 PowerPoint (ppt/pptx) via UnstructuredPowerPointLoader
+                            elif ext in [".pptx", ".ppt"]:
+                                loader = UnstructuredPowerPointLoader(path, mode="single")
+
                             else:
-                                # You can extend this for csv/xlsx/xls/pptx/ppt if you want
+                                # Unknown/unsupported type
                                 failed_files.append(fname)
                                 continue
 
@@ -183,12 +219,14 @@ with st.sidebar:
                                 d.metadata["source"] = path         # optional but useful
 
                             all_docs.extend(docs)
-
                             changed_files.append(fname)
 
                         except Exception as e:
                             failed_files.append(fname)
                             print(f"[WARN] Failed to load {path}: {e}")
+                            st.warning(f"Failed to load {fname}: {e}")
+                            st.exception(e)
+
 
                     # 2) Split into chunks
                     if all_docs:
