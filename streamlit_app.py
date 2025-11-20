@@ -129,7 +129,7 @@ with st.sidebar:
 
     uploaded_files = st.file_uploader(
         "Drop files to ingest",
-        type=["pdf", "docx", "txt", "csv", "xlsx", "xls", "pptx", "ppt"],
+        type=["pdf", "docx", "txt", "xlsx", "xls", "pptx", "ppt"],
         accept_multiple_files=True,
         key=f"uploader_{st.session_state.uploader_key}",
     )
@@ -180,29 +180,9 @@ with st.sidebar:
                             elif ext == ".txt":
                                 loader = TextLoader(path, autodetect_encoding=True)
 
-                            # 🔢 CSV (one Document per row)
-
-                            elif ext == ".csv":
-                                # Use pandas to read CSV robustly
-                                df = pd.read_csv(path)          # add sep=";" here if needed
-                                df = df.fillna("")              # avoid NaN in text
-
-                                # 🔑 Make *all* columns plain Python strings (no numpy ints/floats)
-                                df = df.astype(str)
-
-                                # Now combine each row
-                                df["_combined"] = df.agg(" | ".join, axis=1)
-
-                                # Turn the DataFrame into LangChain Documents
-                                loader = DataFrameLoader(df, page_content_column="_combined")
-
-
                             # 📊 Excel (xls/xlsx) via UnstructuredExcelLoader
                             elif ext in [".xlsx", ".xls"]:
-                                df = pd.read_excel(path)
-                                df = df.fillna("").astype(str)
-                                df["_combined"] = df.agg(" | ".join, axis=1)
-                                loader = DataFrameLoader(df, page_content_column="_combined")
+                                loader= UnstructuredExcelLoader(path, mode="single")
 
                             # 📽 PowerPoint (ppt/pptx) via UnstructuredPowerPointLoader
                             elif ext in [".pptx", ".ppt"]:
