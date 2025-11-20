@@ -156,11 +156,17 @@ yarl==1.22.0
 zipp==3.23.0
 zstandard==0.25.0
 
-
-
+unstructured
+unstructured-inference
+unstructured[ppt]
+unstructured[excel]
+pillow
+python-magic
 msoffcrypto-tool
 networkx
-python-magic
+pytesseract
+opencv-python
+
 
 
 
