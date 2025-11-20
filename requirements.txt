@@ -158,3 +158,9 @@ zstandard==0.25.0
 
 
 
+msoffcrypto-tool
+networkx
+python-magic
+
+
+
