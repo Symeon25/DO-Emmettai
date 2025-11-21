@@ -122,7 +122,7 @@ with st.sidebar:
     )
 
     #st.header("⚙️ Settings")
-
+    import tempfile
     #st.subheader("Session")
     #st.text_input("Session ID (from backend)", value=str(SESSION_ID), disabled=True)
     st.subheader("📁 Add documents")
@@ -134,111 +134,97 @@ with st.sidebar:
         key=f"uploader_{st.session_state.uploader_key}",
     )
 
-    # --- Handle newly uploaded files (this run) ---
-    if uploaded_files:
-        os.makedirs("data", exist_ok=True)  # BASE_DIR
-
-        saved_files = []
+    # --- Handle newly uploaded files in-memory + temp files ---
+    if uploaded_files and st.button("🔄 Upload documents"):
+        all_docs = []
+        changed_files = []
+        failed_files = []
         skipped_files = []
 
-        for f in uploaded_files:
-            # Simple check: empty file
-            if f.size == 0:
-                skipped_files.append(f.name)
-                continue
+        try:
+            with st.spinner("Indexing documents into the vector store…"):
+                for f in uploaded_files:
+                    # Skip empty files
+                    if f.size == 0:
+                        skipped_files.append(f.name)
+                        continue
 
-            save_path = os.path.join("data", f.name)
-            with open(save_path, "wb") as out:
-                out.write(f.read())
-            saved_files.append(f.name)
+                    ext = os.path.splitext(f.name)[1].lower()
 
-        # Store in session so messages survive rerun
-        st.session_state.last_upload_files = saved_files
-        st.session_state.last_skipped_files = skipped_files
+                    # Write to a temporary file (no fixed "data" folder)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                        tmp.write(f.read())
+                        tmp_path = tmp.name
 
-        # Show ingest button only when we have something to ingest
-        if saved_files and st.button("🔄 Upload documents"):
-            changed_files = []
-            failed_files = []
+                    try:
+                        # Choose loader based on extension (path-based loaders)
+                        if ext == ".pdf":
+                            loader = PyPDFLoader(tmp_path)
 
-            try:
-                with st.spinner("Indexing documents into the vector store…"):
-                    all_docs = []
+                        elif ext == ".docx":
+                            loader = Docx2txtLoader(tmp_path)
 
-                    # 1) Load each saved file into Documents
-                    for fname in saved_files:
-                        path = os.path.join("data", fname)
-                        ext = os.path.splitext(path)[1].lower()
+                        elif ext == ".txt":
+                            loader = TextLoader(tmp_path, autodetect_encoding=True)
 
+                        elif ext in [".xlsx", ".xls"]:
+                            loader = UnstructuredExcelLoader(tmp_path, mode="single")
+
+                        elif ext in [".pptx", ".ppt"]:
+                            loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
+
+                        else:
+                            failed_files.append(f.name)
+                            continue
+
+                        docs = loader.load()
+                        for d in docs:
+                            d.metadata["filename"] = f.name
+                            d.metadata["source"] = f.name  # optional, nicer than tmp path
+
+                        all_docs.extend(docs)
+                        changed_files.append(f.name)
+
+                    except Exception as e:
+                        failed_files.append(f.name)
+                        st.warning(f"Failed to load {f.name}: {e}")
+                        st.exception(e)
+
+                    finally:
+                        # Clean up the temporary file
                         try:
-                            if ext == ".pdf":
-                                loader = PyPDFLoader(path)
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
 
-                            elif ext == ".docx":
-                                loader = Docx2txtLoader(path)
+                # 2) Split into chunks and store in PGVector
+                if all_docs:
+                    chunks = split_docs(all_docs)
+                    usage = add_chunks_to_vectorstore(chunks)
 
-                            elif ext == ".txt":
-                                loader = TextLoader(path, autodetect_encoding=True)
+                    print(
+                        f"Indexed files: {', '.join(changed_files)} | "
+                        f"Embedded {usage['total_tokens']} tokens (cost ≈ ${usage['total_cost']:.6f})"
+                    )
 
-                            # 📊 Excel (xls/xlsx) via UnstructuredExcelLoader
-                            elif ext in [".xlsx", ".xls"]:
-                                loader= UnstructuredExcelLoader(path, mode="single")
+            # Save ingest results in session state so we can show messages after rerun
+            st.session_state.last_ingest_changed = changed_files
+            st.session_state.last_ingest_failed = failed_files
+            st.session_state.last_skipped_files = skipped_files
 
-                            # 📽 PowerPoint (ppt/pptx) via UnstructuredPowerPointLoader
-                            elif ext in [".pptx", ".ppt"]:
-                                loader = UnstructuredPowerPointLoader(path, mode="single")
+            # Show only successfully indexed files as "uploaded"
+            if changed_files:
+                st.session_state.last_upload_files = changed_files
+            else:
+                st.session_state.last_upload_files = []
 
-                            else:
-                                # Unknown/unsupported type
-                                failed_files.append(fname)
-                                continue
+            # Reset uploader so file list disappears, then rerun
+            st.session_state.uploader_key += 1
+            st.rerun()
 
-                            docs = loader.load()
-                            for d in docs:
-                                d.metadata["filename"] = fname      # uploaded file name
-                                d.metadata["source"] = path         # optional but useful
-
-                            all_docs.extend(docs)
-                            changed_files.append(fname)
-
-                        except Exception as e:
-                            failed_files.append(fname)
-                            print(f"[WARN] Failed to load {path}: {e}")
-                            st.warning(f"Failed to load {fname}: {e}")
-                            st.exception(e)
-
-
-                    # 2) Split into chunks
-                    if all_docs:
-                        chunks = split_docs(all_docs)
-
-                        # 3) Add chunks directly to PGVector
-                        usage = add_chunks_to_vectorstore(chunks)
-
-                        print(
-                            f"Indexed files: {', '.join(changed_files)} | "
-                            f"Embedded {usage['total_tokens']} tokens (cost ≈ ${usage['total_cost']:.6f})"
-                        )
-
-
-                # Save ingest results in session state so we can show messages after rerun
-                st.session_state.last_ingest_changed = changed_files
-                st.session_state.last_ingest_failed = failed_files
-
-                # ✅ Update the "uploaded" summary to only show successfully indexed files
-                if changed_files:
-                    st.session_state.last_upload_files = changed_files
-                else:
-                    st.session_state.last_upload_files = []
-
-                # Reset uploader so file list disappears, then rerun
-                st.session_state.uploader_key += 1
-                st.rerun()
-
-            except Exception as e:
-                st.error("Error during ingestion")
-                st.exception(e)
-
+        except Exception as e:
+            st.error("Error during ingestion")
+            st.exception(e)
 
     # --- Persistent messages (shown even after uploader reset) ---
     if st.session_state.last_upload_files:
@@ -246,7 +232,6 @@ with st.sidebar:
             f"Uploaded {len(st.session_state.last_upload_files)} file(s): "
             + ", ".join(st.session_state.last_upload_files)
         )
-
 
     if st.session_state.last_skipped_files:
         st.warning(
@@ -256,7 +241,7 @@ with st.sidebar:
 
     if st.session_state.last_ingest_changed:
         st.info(
-            "Upload complete!"
+            "Upload complete! "
             f"{len(st.session_state.last_ingest_changed)} file(s): "
             + ", ".join(st.session_state.last_ingest_changed)
         )
@@ -266,7 +251,6 @@ with st.sidebar:
             "The following file(s) failed and were removed:\n\n"
             + ", ".join(st.session_state.last_ingest_failed)
         )
-
 
     st.divider()
 
