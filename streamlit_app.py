@@ -127,6 +127,7 @@ with st.sidebar:
     #st.text_input("Session ID (from backend)", value=str(SESSION_ID), disabled=True)
     st.subheader("📁 Add documents")
 
+    # File uploader: key is based on uploader_key so we can reset it
     uploaded_files = st.file_uploader(
         "Drop files to ingest",
         type=["pdf", "docx", "txt", "pptx", "ppt"],
@@ -134,7 +135,6 @@ with st.sidebar:
         key=f"uploader_{st.session_state.uploader_key}",
     )
 
-    # --- Handle newly uploaded files in-memory + temp files ---
     if uploaded_files and st.button("🔄 Upload documents"):
         all_docs = []
         changed_files = []
@@ -151,25 +151,21 @@ with st.sidebar:
 
                     ext = os.path.splitext(f.name)[1].lower()
 
-                    # Write to a temporary file (no fixed "data" folder)
+                    # Save to a temporary file (no fixed data folder)
                     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
                         tmp.write(f.read())
                         tmp_path = tmp.name
 
                     try:
-                        # Choose loader based on extension (path-based loaders)
+                        # Choose loader based on extension
                         if ext == ".pdf":
                             loader = PyPDFLoader(tmp_path)
-
                         elif ext == ".docx":
                             loader = Docx2txtLoader(tmp_path)
-
                         elif ext == ".txt":
                             loader = TextLoader(tmp_path, autodetect_encoding=True)
-
                         elif ext in [".pptx", ".ppt"]:
                             loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
-
                         else:
                             failed_files.append(f.name)
                             continue
@@ -177,7 +173,7 @@ with st.sidebar:
                         docs = loader.load()
                         for d in docs:
                             d.metadata["filename"] = f.name
-                            d.metadata["source"] = f.name  # optional, nicer than tmp path
+                            d.metadata["source"] = f.name  # nicer than tmp path
 
                         all_docs.extend(docs)
                         changed_files.append(f.name)
@@ -188,13 +184,13 @@ with st.sidebar:
                         st.exception(e)
 
                     finally:
-                        # Clean up the temporary file
+                        # Always clean up the temp file
                         try:
                             os.remove(tmp_path)
                         except Exception:
                             pass
 
-                # 2) Split into chunks and store in PGVector
+                # Split into chunks and store in PGVector
                 if all_docs:
                     chunks = split_docs(all_docs)
                     usage = add_chunks_to_vectorstore(chunks)
@@ -204,24 +200,21 @@ with st.sidebar:
                         f"Embedded {usage['total_tokens']} tokens (cost ≈ ${usage['total_cost']:.6f})"
                     )
 
-            # Save ingest results in session state so we can show messages after rerun
+            # Save ingest results for messages after rerun
             st.session_state.last_ingest_changed = changed_files
             st.session_state.last_ingest_failed = failed_files
             st.session_state.last_skipped_files = skipped_files
-
-            # Show only successfully indexed files as "uploaded"
-            if changed_files:
-                st.session_state.last_upload_files = changed_files
-            else:
-                st.session_state.last_upload_files = []
-
-            # Reset uploader so file list disappears, then rerun
-            st.session_state.uploader_key += 1
-            st.rerun()
+            st.session_state.last_upload_files = changed_files if changed_files else []
 
         except Exception as e:
             st.error("Error during ingestion")
             st.exception(e)
+
+        finally:
+            # 🔑 CRITICAL: reset uploader widget so a failed upload
+            # doesn't break future uploads
+            st.session_state.uploader_key += 1
+            st.rerun()
 
     # --- Persistent messages (shown even after uploader reset) ---
     if st.session_state.last_upload_files:
@@ -248,6 +241,7 @@ with st.sidebar:
             "The following file(s) failed and were removed:\n\n"
             + ", ".join(st.session_state.last_ingest_failed)
         )
+
 
     st.divider()
 
