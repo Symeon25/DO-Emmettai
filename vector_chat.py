@@ -35,7 +35,7 @@ dense = vectorstore.as_retriever(
     search_type="mmr",
     search_kwargs={"k": BASE_K, "fetch_k": FETCH_K, "lambda_mult": 0.7},
 )
-#dense = vectorstore.as_retriever(    search_kwargs={"k": 20} )
+#dense = vectorstore.as_retriever( search_kwargs={"k": 20} )
 
 
 answer_llm = ChatOpenAI(
@@ -159,6 +159,7 @@ prompt = ChatPromptTemplate.from_messages(
 
 contextualize_q_chain = rewrite_prompt | rerank_llm | StrOutputParser()
 
+"""
 answer_prompt = ChatPromptTemplate.from_messages(
     [
         (
@@ -176,6 +177,23 @@ answer_prompt = ChatPromptTemplate.from_messages(
         ("human", "{question}"),
     ]
 )
+"""
+answer_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You write in a very detailed, elegant tone, formatting all answers in Markdown. "
+            "You are a helpful assistant. If the user expresses gratitude (e.g., 'thank you' or 'thanks'), "
+            "reply with a polite, friendly response (e.g., 'You're very welcome!'). "
+            "Otherwise, use ONLY the provided context to answer accurately and concisely. "
+            "Retrieve data only from the database and at the end of your answer, always append a tag "
+            "in the format: [File: <filenames>]. "
+        ),
+        ("system", "Context:\n{context}"),
+        ("human", "{question}"),
+    ]
+)
+
 
 def maybe_rewrite(question, chat_history):
     if not chat_history or len(chat_history) < 2:
