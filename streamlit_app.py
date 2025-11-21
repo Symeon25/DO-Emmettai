@@ -28,7 +28,7 @@ from langchain_community.document_loaders import (
     DataFrameLoader,     
 )
 import pandas as pd
-
+import tempfile
 import base64
 
 def load_logo_base64(path):
@@ -115,24 +115,18 @@ if "last_ingest_failed" not in st.session_state:
 
 
 with st.sidebar:
-    #st.image("logo/LogoAI2.png", width=200)
     st.markdown(
-    f"<img src='{logo_data}' style='width:200px;'>",
-    unsafe_allow_html=True
+        f"<img src='{logo_data}' style='width:200px;'>",
+        unsafe_allow_html=True
     )
-
-    #st.header("⚙️ Settings")
-    import tempfile
-    #st.subheader("Session")
-    #st.text_input("Session ID (from backend)", value=str(SESSION_ID), disabled=True)
+    st.divider()
     st.subheader("📁 Add documents")
 
-    # File uploader: key is based on uploader_key so we can reset it
+    # Simple, stable uploader: NO dynamic key
     uploaded_files = st.file_uploader(
         "Drop files to ingest",
         type=["pdf", "docx", "txt", "pptx", "ppt"],
         accept_multiple_files=True,
-        key=f"uploader_{st.session_state.uploader_key}",
     )
 
     if uploaded_files and st.button("🔄 Upload documents"):
@@ -173,7 +167,7 @@ with st.sidebar:
                         docs = loader.load()
                         for d in docs:
                             d.metadata["filename"] = f.name
-                            d.metadata["source"] = f.name  # nicer than tmp path
+                            d.metadata["source"] = f.name
 
                         all_docs.extend(docs)
                         changed_files.append(f.name)
@@ -184,23 +178,22 @@ with st.sidebar:
                         st.exception(e)
 
                     finally:
-                        # Always clean up the temp file
+                        # Clean up temp file
                         try:
                             os.remove(tmp_path)
                         except Exception:
                             pass
 
-                # Split into chunks and store in PGVector
+                # Split into chunks + store in PGVector
                 if all_docs:
                     chunks = split_docs(all_docs)
                     usage = add_chunks_to_vectorstore(chunks)
-
                     print(
                         f"Indexed files: {', '.join(changed_files)} | "
                         f"Embedded {usage['total_tokens']} tokens (cost ≈ ${usage['total_cost']:.6f})"
                     )
 
-            # Save ingest results for messages after rerun
+            # Store messages in session (optional)
             st.session_state.last_ingest_changed = changed_files
             st.session_state.last_ingest_failed = failed_files
             st.session_state.last_skipped_files = skipped_files
@@ -210,13 +203,7 @@ with st.sidebar:
             st.error("Error during ingestion")
             st.exception(e)
 
-        finally:
-            # 🔑 CRITICAL: reset uploader widget so a failed upload
-            # doesn't break future uploads
-            st.session_state.uploader_key += 1
-            st.rerun()
-
-    # --- Persistent messages (shown even after uploader reset) ---
+    # --- Persistent messages ---
     if st.session_state.last_upload_files:
         st.success(
             f"Uploaded {len(st.session_state.last_upload_files)} file(s): "
@@ -241,6 +228,7 @@ with st.sidebar:
             "The following file(s) failed and were removed:\n\n"
             + ", ".join(st.session_state.last_ingest_failed)
         )
+
 
 
     st.divider()
