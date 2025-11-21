@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from collections import defaultdict
 from operator import itemgetter
 
@@ -15,25 +16,29 @@ from langchain_openai import ChatOpenAI
 from langchain_community.callbacks import get_openai_callback
 from langchain_core.tools import tool
 
-# 👉 our own vector / embeddings backend
+
 from vector_store import (
     vectorstore,       # PGVector instance
     MODEL,             # chat model name ("gpt-4o-mini", etc.)
     compute_cost,      # cost calculator
 )
 
-# ----------------- Basic config -----------------
+# ----------------- Basic config -----------------TOP_K
 
-TOP_K = int(os.getenv("TOP_K", "5"))
+TOP_K = int(os.getenv("TOP_K", "15"))
+BASE_K = max(TOP_K, 20)           # at least 20 candidates
+FETCH_K = max(TOP_K * 2, 40)      # at least 40 for MMR diversity
 
 # ----------------- Retrievers: Dense + LLM Reranker -----------------
 
 dense = vectorstore.as_retriever(
     search_type="mmr",
-    search_kwargs={"k": 20, "fetch_k": 40, "lambda_mult": 0.7},
+    search_kwargs={"k": BASE_K, "fetch_k": FETCH_K, "lambda_mult": 0.7},
 )
+#dense = vectorstore.as_retriever(    search_kwargs={"k": 20} )
 
-llm = ChatOpenAI(
+
+answer_llm = ChatOpenAI(
     temperature=0.0,
     top_p=0.9,
     model=MODEL,
@@ -41,6 +46,13 @@ llm = ChatOpenAI(
     stream_usage=True,
 )
 
+rerank_llm = ChatOpenAI(
+    temperature=0.0,
+    top_p=0.9,
+    model=MODEL,
+    streaming=False,
+    stream_usage=True,
+)
 
 def rerank_with_llm(question: str, docs, top_k: int = 5):
     """
@@ -67,15 +79,17 @@ Return the indices (comma-separated) of the TOP {top_k} most relevant [Doc i] ch
 Only return the indices, e.g.: 0,2,3,5,6
 """
 
-    raw = llm.invoke(prompt).content.strip()
+    raw = rerank_llm.invoke(prompt).content
 
-    # --- parse indices, dedupe, and cap to top_k ---
+    # --- robustly parse indices from model output ---
+    # Extract all integers from the response (e.g. "Top: 0, 1, 5" or "[0, 2, 5]")
+    candidates = re.findall(r"\d+", raw)
+
     indices = []
-    for part in raw.replace(" ", "").split(","):
-        if part.isdigit():
-            idx = int(part)
-            if 0 <= idx < len(docs):
-                indices.append(idx)
+    for c in candidates:
+        idx = int(c)
+        if 0 <= idx < len(docs):
+            indices.append(idx)
 
     # Deduplicate while preserving order
     seen = set()
@@ -93,6 +107,7 @@ Only return the indices, e.g.: 0,2,3,5,6
         return docs[: min(top_k, len(docs))]
 
     return [docs[i] for i in unique_indices]
+
 
 def dense_with_rerank(query: str, top_k: int = TOP_K):
     retrieved = dense.invoke(query)   # 20 docs from MMR
@@ -142,7 +157,7 @@ prompt = ChatPromptTemplate.from_messages(
 )
 """
 
-contextualize_q_chain = rewrite_prompt | llm | StrOutputParser()
+contextualize_q_chain = rewrite_prompt | rerank_llm | StrOutputParser()
 
 answer_prompt = ChatPromptTemplate.from_messages(
     [
@@ -178,7 +193,7 @@ rag_chain = (
     .assign(context=(itemgetter("standalone_question") | retriever_runnable | format_runnable))
     .assign(question=itemgetter("standalone_question"))
     | answer_prompt
-    | llm
+    | answer_llm
     | StrOutputParser()
 )
 
@@ -283,7 +298,7 @@ def rag_answer(question: str, session_id: str = SESSION_ID, top_k: int = TOP_K):
 
     docs = dense_with_rerank(standalone,  top_k=top_k)
     context_text = format_docs(docs)
-    final = (answer_prompt | llm | StrOutputParser()).invoke(
+    final = (answer_prompt | answer_llm | StrOutputParser()).invoke(
         {"context": context_text, "question": standalone}
     )
 
@@ -291,7 +306,7 @@ def rag_answer(question: str, session_id: str = SESSION_ID, top_k: int = TOP_K):
     for d in docs[:top_k]:
         md = d.metadata or {}
         src = md.get("source", "unknown")
-        filename = md.get("filename") or os.path.basename(src) if src else "unknown"
+        filename = md.get("filename") or (os.path.basename(src) if src else "unknown")
         sources.append(
             {
                 "file": filename,
