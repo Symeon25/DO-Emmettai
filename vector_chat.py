@@ -1,360 +1,376 @@
 import os
-import json
-import re
-from collections import defaultdict
-from operator import itemgetter
+import time
+import traceback
+import streamlit as st
 
-from dotenv import load_dotenv
-load_dotenv()
-
-from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
-from langchain_openai import ChatOpenAI
-from langchain_community.callbacks import get_openai_callback
-from langchain_core.tools import tool
-
+# ---- Import your existing backend without altering it ----
+from vector_chat import (
+    chat,
+    USAGE_TOTALS,
+    SESSION_ID,
+    reset_history,
+)
 
 from vector_store import (
-    vectorstore,       # PGVector instance
-    MODEL,             # chat model name ("gpt-4o-mini", etc.)
-    compute_cost,      # cost calculator
-)
-
-# ----------------- Basic config -----------------TOP_K
-
-TOP_K = int(os.getenv("TOP_K", "15"))
-BASE_K = max(TOP_K, 20)           # at least 20 candidates
-FETCH_K = max(TOP_K * 2, 40)      # at least 40 for MMR diversity
-
-# ----------------- Retrievers: Dense + LLM Reranker -----------------
-
-dense = vectorstore.as_retriever(
-    search_type="mmr",
-    search_kwargs={"k": BASE_K, "fetch_k": FETCH_K, "lambda_mult": 0.7},
-)
-#dense = vectorstore.as_retriever( search_kwargs={"k": 20} )
-
-
-answer_llm = ChatOpenAI(
-    temperature=0.0,
-    top_p=0.9,
-    model=MODEL,
-    streaming=True,
-    stream_usage=True,
-)
-
-rerank_llm = ChatOpenAI(
-    temperature=0.0,
-    top_p=0.9,
-    model=MODEL,
-    streaming=False,
-    stream_usage=True,
-)
-
-def rerank_with_llm(question: str, docs, top_k: int = 5):
-    """
-    Rerank retrieved chunks using an LLM and return up to `top_k` UNIQUE docs.
-    """
-    if not docs:
-        return []
-
-    context_block = "\n\n---\n\n".join(
-        f"[Doc {i}]\n{d.page_content}" for i, d in enumerate(docs)
+        add_chunks_to_vectorstore,
+        embeddings,
+        split_docs,
+        COLLECTION
     )
 
-    prompt = f"""
-You are a retrieval reranker.
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    Docx2txtLoader,
+    TextLoader,
+    CSVLoader,                    
+    UnstructuredPowerPointLoader, 
+    UnstructuredExcelLoader, 
+    DataFrameLoader,     
+)
+import pandas as pd
 
-User question:
-{question}
+import base64
 
-Here are candidate document chunks:
+def load_logo_base64(path):
+    with open(path, "rb") as image_file:
+        encoded = base64.b64encode(image_file.read()).decode()
+        return f"data:image/png;base64,{encoded}"
 
-{context_block}
-
-Return the indices (comma-separated) of the TOP {top_k} most relevant [Doc i] chunks.
-Only return the indices, e.g.: 0,2,3,5,6
-"""
-
-    raw = rerank_llm.invoke(prompt).content
-
-    # --- robustly parse indices from model output ---
-    # Extract all integers from the response (e.g. "Top: 0, 1, 5" or "[0, 2, 5]")
-    candidates = re.findall(r"\d+", raw)
-
-    indices = []
-    for c in candidates:
-        idx = int(c)
-        if 0 <= idx < len(docs):
-            indices.append(idx)
-
-    # Deduplicate while preserving order
-    seen = set()
-    unique_indices = []
-    for idx in indices:
-        if idx not in seen:
-            seen.add(idx)
-            unique_indices.append(idx)
-
-    # Enforce top_k cap
-    unique_indices = unique_indices[:top_k]
-
-    # Fallback if model output is unusable
-    if not unique_indices:
-        return docs[: min(top_k, len(docs))]
-
-    return [docs[i] for i in unique_indices]
-
-
-def dense_with_rerank(query: str, top_k: int = TOP_K):
-    retrieved = dense.invoke(query)   # 20 docs from MMR
-    top_docs = rerank_with_llm(query, retrieved, top_k=top_k)
-    return top_docs
-
-
-# This is what the RAG chain uses:
-retriever_runnable = RunnableLambda(lambda q: dense_with_rerank(q))
+logo_data = load_logo_base64("logo/LogoAI2.png")
 
 
 
-# ----------------- LLM + prompts -----------------
-
-rewrite_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "Given the chat history and the latest user message, rewrite the message into a standalone question. "
-            "Only return the rewritten question.",
-        ),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{question}"),
-    ]
+# ------------------------- Page config -------------------------
+st.set_page_config(
+    page_title="EMMETT.ai",
+    page_icon="💬",
+    layout="wide",
 )
 
-def format_docs(docs):
-    """
-    Format retrieved docs into a text block with [Source: <filename>] headers.
-    """
-    formatted = []
-    for d in docs:
-        md = d.metadata or {}
-        src = md.get("source", "unknown")
-        filename = md.get("filename") or os.path.basename(src) if src else "unknown"
-        formatted.append(f"[Source: {filename}]\n{d.page_content}")
-    return "\n\n---\n\n".join(formatted)
+# ------------------------- Login -------------------------
+APP_USERNAME = os.getenv("APP_USERNAME")   # default optional
+APP_PASSWORD = os.getenv("APP_PASSWORD")             # no default on purpose
 
-"""
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", "You are a helpful assistant. Use the provided context to answer accurately and concisely."),
-        MessagesPlaceholder("chat_history"),
-        ("system", "Context:\n{context}"),
-        ("human", "{question}"),
-    ]
-)
-"""
+if "authed" not in st.session_state:
+    st.session_state.authed = False
+if "user" not in st.session_state:
+    st.session_state.user = None
 
-contextualize_q_chain = rewrite_prompt | rerank_llm | StrOutputParser()
+def require_login():
+    if st.session_state.authed:
+        return
 
-"""
-answer_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You write in a very detailed, elegant tone, formatting all answers in Markdown. "
-            "You are a helpful assistant. If the user expresses gratitude (e.g., 'thank you' or 'thanks'), "
-            "reply with a polite, friendly response (e.g., 'You're very welcome!'). "
-            "Otherwise, use ONLY the provided context to answer accurately and concisely. "
-            "Retrieve data only from the database and at the end of your answer, always append a tag "
-            "in the format: [File: <filenames>]. "
-            "If the question is not answerable from the database context, try to answer but mention "
-            "it is not from the database, then append [File: None]."
-        ),
-        ("system", "Context:\n{context}"),
-        ("human", "{question}"),
-    ]
-)
-"""
-answer_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You write in a very detailed, elegant tone, formatting all answers in Markdown. "
-            "You are a helpful assistant. If the user expresses gratitude (e.g., 'thank you' or 'thanks'), "
-            "reply with a polite, friendly response (e.g., 'You're very welcome!'). "
-            "Otherwise, use ONLY the provided context to answer accurately and concisely. "
-            "Retrieve data only from the database and at the end of your answer, always append a tag "
-            "in the format: [File: <filenames>]. "
-        ),
-        ("system", "Context:\n{context}"),
-        ("human", "{question}"),
-    ]
-)
-
-
-def maybe_rewrite(question, chat_history):
-    if not chat_history or len(chat_history) < 2:
-        return question
-    return contextualize_q_chain.invoke({"question": question, "chat_history": chat_history[:]})
-
-# ----------------- RAG chain -----------------
-
-#retriever_runnable = RunnableLambda(lambda q: hybrid.invoke(q))
-format_runnable = RunnableLambda(format_docs)
-
-rag_chain = (
-    RunnablePassthrough()
-    .assign(standalone_question=lambda x: maybe_rewrite(x["question"], x.get("chat_history", [])))
-    .assign(context=(itemgetter("standalone_question") | retriever_runnable | format_runnable))
-    .assign(question=itemgetter("standalone_question"))
-    | answer_prompt
-    | answer_llm
-    | StrOutputParser()
-)
-
-# ----------------- Chat history (memory) -----------------
-
-_histories: dict[str, InMemoryChatMessageHistory] = {}
-
-def get_history(session_id: str) -> InMemoryChatMessageHistory:
-    if session_id not in _histories:
-        _histories[session_id] = InMemoryChatMessageHistory()
-    return _histories[session_id]
-
-chat_chain = RunnableWithMessageHistory(
-    rag_chain,
-    get_history,
-    input_messages_key="question",
-    history_messages_key="chat_history",
-)
-
-SESSION_ID = os.getenv("SESSION_ID", "default-session")
-
-def is_trivial(query: str) -> bool:
-    q = (query or "").strip().lower()
-    return len(q.split()) <= 2 and q in {
-        "hi", "hey", "hello", "yo", "sup", "good morning", "good evening"
-    }
-
-# ----------------- Usage tracking -----------------
-
-USAGE_TOTALS = defaultdict(float)  # keys: prompt_tokens, completion_tokens, total_tokens, total_cost
-SESSION_TOTALS = defaultdict(lambda: defaultdict(float))  # per-session buckets
-
-
-def chat(message: str, history, session_id: str | None = None) -> str:
-    """
-    Main chat entrypoint used by the frontend.
-
-    - `session_id` controls which conversation memory is used.
-    - If None, falls back to the global SESSION_ID.
-    - `history` is only for UI; memory is kept server-side in _histories.
-    """
-    if is_trivial(message):
-        return "Hi I am EMMETT.ai! How can I assist you today?"
-
-    sid = session_id or SESSION_ID
-
-    with get_openai_callback() as cb:
-        result = chat_chain.invoke(
-            {"question": message},
-            config={
-                "callbacks": [cb],
-                "configurable": {"session_id": sid},
-            },
-        )
-
-    cost = compute_cost(cb.prompt_tokens, cb.completion_tokens, model=MODEL)
-
-    # Global totals
-    USAGE_TOTALS["prompt_tokens"]     += cb.prompt_tokens
-    USAGE_TOTALS["completion_tokens"] += cb.completion_tokens
-    USAGE_TOTALS["total_tokens"]      += cb.total_tokens
-    USAGE_TOTALS["total_cost"]        += cost
-
-    # Per-session totals
-    SESSION_TOTALS[sid]["prompt_tokens"]     += cb.prompt_tokens
-    SESSION_TOTALS[sid]["completion_tokens"] += cb.completion_tokens
-    SESSION_TOTALS[sid]["total_tokens"]      += cb.total_tokens
-    SESSION_TOTALS[sid]["total_cost"]        += cost
-
-    print(
-        f"[SESSION {sid}] Prompt={cb.prompt_tokens}  Completion={cb.completion_tokens}  "
-        f"Total={cb.total_tokens}  Cost=${cost:.6f}  ||  "
-        f"[TOTAL USAGE] Tokens={USAGE_TOTALS['total_tokens']:.0f}  "
-        f"Cost=${USAGE_TOTALS['total_cost']:.4f}"
+    #st.image("logo/LogoAI2.png", width=300)
+    st.markdown(
+    f"<img src='{logo_data}' style='width:300px;'>",
+    unsafe_allow_html=True
     )
 
-    return result
+    st.markdown("### 🔒 Please log in to continue")
+    with st.form("login-form", clear_on_submit=False):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submit = st.form_submit_button("Login")
+
+    if submit:
+        if APP_PASSWORD is None:
+            # If you forgot to set APP_PASSWORD on the server, fail safely
+            st.error("Server login is not configured correctly (APP_PASSWORD missing).")
+        elif username == APP_USERNAME and password == APP_PASSWORD:
+            st.session_state.authed = True
+            st.session_state.user = username
+            st.success("Login successful ✅")
+            st.rerun()
+        else:
+            st.error("Invalid username or password ❌")
 
 
-def reset_history(session_id: str = SESSION_ID):
-    """
-    Clear the conversation history for a given session_id.
-    Used when the UI starts a 'New conversation'.
-    """
-    sid = session_id or SESSION_ID
-    if sid in _histories:
+require_login()
+if not st.session_state.authed:
+    st.stop()  # prevent rest of UI from rendering until logged in
+if "session_id" not in st.session_state:
+    st.session_state.conv_counter = 1
+    st.session_state.session_id = f"{st.session_state.user}-conv-1"
+
+if "past_conversations" not in st.session_state:
+    # Each item: {"id": str, "title": str, "messages": [...]}
+    st.session_state.past_conversations = []
+
+if "messages" not in st.session_state:
+    # Chat history for the CURRENT conversation
+    st.session_state.messages = []
+
+# ------------------------- Sidebar ----------------------------
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+if "last_upload_files" not in st.session_state:
+    st.session_state.last_upload_files = []
+if "last_skipped_files" not in st.session_state:
+    st.session_state.last_skipped_files = []
+if "last_ingest_changed" not in st.session_state:
+    st.session_state.last_ingest_changed = []
+if "last_ingest_failed" not in st.session_state:
+    st.session_state.last_ingest_failed = []
+
+
+
+with st.sidebar:
+    #st.image("logo/LogoAI2.png", width=200)
+    st.markdown(
+    f"<img src='{logo_data}' style='width:200px;'>",
+    unsafe_allow_html=True
+    )
+
+    #st.header("⚙️ Settings")
+    import tempfile
+    #st.subheader("Session")
+    #st.text_input("Session ID (from backend)", value=str(SESSION_ID), disabled=True)
+    st.subheader("📁 Add documents")
+
+    uploaded_files = st.file_uploader(
+        "Drop files to ingest",
+        type=["pdf", "docx", "txt", "xlsx", "xls", "pptx", "ppt"],
+        accept_multiple_files=True,
+        key=f"uploader_{st.session_state.uploader_key}",
+    )
+
+    # --- Handle newly uploaded files in-memory + temp files ---
+    if uploaded_files and st.button("🔄 Upload documents"):
+        all_docs = []
+        changed_files = []
+        failed_files = []
+        skipped_files = []
+
         try:
-            _histories[sid].clear()
-        except Exception:
-            _histories[sid] = InMemoryChatMessageHistory()
+            with st.spinner("Indexing documents into the vector store…"):
+                for f in uploaded_files:
+                    # Skip empty files
+                    if f.size == 0:
+                        skipped_files.append(f.name)
+                        continue
 
+                    ext = os.path.splitext(f.name)[1].lower()
 
-# ----------------- RAG helper + tool (optional) -----------------
+                    # Write to a temporary file (no fixed "data" folder)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                        tmp.write(f.read())
+                        tmp_path = tmp.name
 
-def rag_answer(question: str, session_id: str = SESSION_ID, top_k: int = TOP_K):
-    """
-    Returns a structured result for agents or debugging.
-    """
-    hist = _histories.get(session_id)
-    chat_history = hist.messages if hist is not None else []
-    standalone = maybe_rewrite(question, chat_history)
+                    try:
+                        # Choose loader based on extension (path-based loaders)
+                        if ext == ".pdf":
+                            loader = PyPDFLoader(tmp_path)
 
-    docs = dense_with_rerank(standalone,  top_k=top_k)
-    context_text = format_docs(docs)
-    final = (answer_prompt | answer_llm | StrOutputParser()).invoke(
-        {"context": context_text, "question": standalone}
-    )
+                        elif ext == ".docx":
+                            loader = Docx2txtLoader(tmp_path)
 
-    sources = []
-    for d in docs[:top_k]:
-        md = d.metadata or {}
-        src = md.get("source", "unknown")
-        filename = md.get("filename") or (os.path.basename(src) if src else "unknown")
-        sources.append(
-            {
-                "file": filename,
-                "full_path": src,
-                "chunk_id": md.get("chunk_id"),
-                "snippet": d.page_content[:280],
-            }
+                        elif ext == ".txt":
+                            loader = TextLoader(tmp_path, autodetect_encoding=True)
+
+                        elif ext in [".xlsx", ".xls"]:
+                            loader = UnstructuredExcelLoader(tmp_path, mode="single")
+
+                        elif ext in [".pptx", ".ppt"]:
+                            loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
+
+                        else:
+                            failed_files.append(f.name)
+                            continue
+
+                        docs = loader.load()
+                        for d in docs:
+                            d.metadata["filename"] = f.name
+                            d.metadata["source"] = f.name  # optional, nicer than tmp path
+
+                        all_docs.extend(docs)
+                        changed_files.append(f.name)
+
+                    except Exception as e:
+                        failed_files.append(f.name)
+                        st.warning(f"Failed to load {f.name}: {e}")
+                        st.exception(e)
+
+                    finally:
+                        # Clean up the temporary file
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+
+                # 2) Split into chunks and store in PGVector
+                if all_docs:
+                    chunks = split_docs(all_docs)
+                    usage = add_chunks_to_vectorstore(chunks)
+
+                    print(
+                        f"Indexed files: {', '.join(changed_files)} | "
+                        f"Embedded {usage['total_tokens']} tokens (cost ≈ ${usage['total_cost']:.6f})"
+                    )
+
+            # Save ingest results in session state so we can show messages after rerun
+            st.session_state.last_ingest_changed = changed_files
+            st.session_state.last_ingest_failed = failed_files
+            st.session_state.last_skipped_files = skipped_files
+
+            # Show only successfully indexed files as "uploaded"
+            if changed_files:
+                st.session_state.last_upload_files = changed_files
+            else:
+                st.session_state.last_upload_files = []
+
+            # Reset uploader so file list disappears, then rerun
+            st.session_state.uploader_key += 1
+            st.rerun()
+
+        except Exception as e:
+            st.error("Error during ingestion")
+            st.exception(e)
+
+    # --- Persistent messages (shown even after uploader reset) ---
+    if st.session_state.last_upload_files:
+        st.success(
+            f"Uploaded {len(st.session_state.last_upload_files)} file(s): "
+            + ", ".join(st.session_state.last_upload_files)
         )
 
-    confidence = min(1.0, len(docs) / float(top_k or 1))
+    if st.session_state.last_skipped_files:
+        st.warning(
+            "Skipped empty file(s): "
+            + ", ".join(st.session_state.last_skipped_files)
+        )
+
+    if st.session_state.last_ingest_changed:
+        st.info(
+            "Upload complete! "
+            f"{len(st.session_state.last_ingest_changed)} file(s): "
+            + ", ".join(st.session_state.last_ingest_changed)
+        )
+
+    if st.session_state.last_ingest_failed:
+        st.warning(
+            "The following file(s) failed and were removed:\n\n"
+            + ", ".join(st.session_state.last_ingest_failed)
+        )
+
+    st.divider()
+
+    st.subheader("💬 Conversations")
+
+    #st.markdown(f"**Current conversation ID:** `{st.session_state.session_id}`")
+
+    # Show past conversations with ability to "see" and "load" them
+    if st.session_state.past_conversations:
+        st.markdown("**Past conversations:**")
+        for idx, conv in enumerate(st.session_state.past_conversations):
+            # Give the expander a unique key as well (optional but safer)
+            with st.expander(f"{conv['title']}", expanded=False):
+                # Show messages from that past conversation
+                for m in conv["messages"]:
+                    role_label = "👤 User" if m["role"] == "user" else "🤖 Assistant"
+                    st.markdown(f"**{role_label}:** {m['content']}")
+
+                # 👉 Button to load this conversation as the active one
+                if st.button(
+                    "Load this conversation",
+                    key=f"load_{idx}_{conv['id']}",   # ✅ now guaranteed unique
+                ):
+                    # 1. Switch current session_id to this past one
+                    st.session_state.session_id = conv["id"]
+
+                    # 2. Restore UI messages
+                    st.session_state.messages = conv["messages"].copy()
+
+                    # 3. Rerun so the main chat area shows this conversation
+                    st.rerun()
+    else:
+        st.caption("No past conversations yet.")
 
 
-    return {
-        "answer": final,
-        "sources": sources,
-        "used_db": True,
-        "confidence": confidence,
-    }
+    # Button to start a new conversation
+    if st.button("➕ New conversation"):
+        # 1. Save current conversation to history (if non-empty)
+        if st.session_state.get("messages"):
+            first_msg = next(
+                (m for m in st.session_state.messages if m["role"] == "user"),
+                None,
+            )
+            title = (first_msg["content"][:40] + "…") if first_msg else "Untitled"
+
+            st.session_state.past_conversations.append(
+                {
+                    "id": st.session_state.session_id,
+                    "title": title,
+                    "messages": st.session_state.messages.copy(),
+                }
+            )
+
+        # 2. Increment conversation counter and build a new session_id
+        st.session_state.conv_counter += 1
+        new_session_id = f"{st.session_state.user}-conv-{st.session_state.conv_counter}"
+        st.session_state.session_id = new_session_id
+
+        # 3. Clear UI messages
+        st.session_state.messages = []
+
+        # 4. Reset backend history for the *new* session id (fresh memory)
+        reset_history(st.session_state.session_id)
+
+        # 5. Rerun to clear chat display
+        st.rerun()
+
+    st.divider()
 
 
-@tool("rag_lookup")
-def rag_lookup(question: str) -> str:
-    """
-    Retrieve an answer from the local document database.
-    Returns a JSON string with: answer, sources, used_db, confidence.
-    """
-    out = rag_answer(question)
-    return json.dumps(out, ensure_ascii=False)
+    st.subheader("💳 Usage (chat)")
+    try:
+        st.metric("Prompt tokens", int(USAGE_TOTALS.get("prompt_tokens", 0)))
+        st.metric("Completion tokens", int(USAGE_TOTALS.get("completion_tokens", 0)))
+        st.metric("Total tokens", int(USAGE_TOTALS.get("total_tokens", 0)))
+        st.metric("Total cost", f"${float(USAGE_TOTALS.get('total_cost', 0.0)):.4f}")
+        st.caption("Totals reflect this Python process; they reset on restart.")
+    except Exception:
+        st.info("Usage totals not available.")
 
+# ------------------------- Main area ---------------------------
 
-__all__ = ["chat", "USAGE_TOTALS", "SESSION_ID", "reset_history", "rag_lookup", "rag_answer"]
+#st.image("LogoAI2.png", width=300)
+st.markdown(
+    f"<img src='{logo_data}' style='width:300px;'>",
+    unsafe_allow_html=True
+    )
+# messages already initialized above, so no need to re-check here, but safe:
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
+# Render existing messages
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
+user_input = st.chat_input("Type your question…")
+
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        try:
+            start = time.time()
+            response_text = chat(
+                user_input,
+                st.session_state.messages,
+                session_id=st.session_state.session_id,  # 👈 key change
+            )
+            elapsed = time.time() - start
+
+            placeholder.markdown(response_text, unsafe_allow_html=False)
+            st.caption(f"Responded in {elapsed:.2f}s")
+        except Exception:
+            placeholder.error("Something went wrong while calling the backend.")
+            st.exception(traceback.format_exc())
+            response_text = ""
+
+    if response_text:
+        st.session_state.messages.append({"role": "assistant", "content": response_text})
