@@ -129,7 +129,7 @@ with st.sidebar:
 
     uploaded_files = st.file_uploader(
         "Drop files to ingest",
-        type=["pdf", "docx", "txt", "xlsx", "xls", "pptx", "ppt"],
+        type=["pdf", "docx", "txt", "pptx", "ppt"],
         accept_multiple_files=True,
         key=f"uploader_{st.session_state.uploader_key}",
     )
@@ -166,9 +166,6 @@ with st.sidebar:
 
                         elif ext == ".txt":
                             loader = TextLoader(tmp_path, autodetect_encoding=True)
-
-                        elif ext in [".xlsx", ".xls"]:
-                            loader = UnstructuredExcelLoader(tmp_path, mode="single")
 
                         elif ext in [".pptx", ".ppt"]:
                             loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
