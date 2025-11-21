@@ -125,6 +125,7 @@ with st.sidebar:
 
     #st.subheader("Session")
     #st.text_input("Session ID (from backend)", value=str(SESSION_ID), disabled=True)
+    st.divider()
     st.subheader("📁 Add documents")
 
     uploaded_files = st.file_uploader(
@@ -390,3 +391,4 @@ if user_input:
 
     if response_text:
         st.session_state.messages.append({"role": "assistant", "content": response_text})
+
