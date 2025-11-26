@@ -1,29 +1,60 @@
-# history_store.py
-import os
+# history_store_new.py
 import json
 from typing import List, Dict, Any
+from db import get_conn
 
-HISTORY_DIR = "history"
-
-if not os.path.exists(HISTORY_DIR):
-    os.makedirs(HISTORY_DIR, exist_ok=True)
-
-def history_path(username: str) -> str:
-    safe_user = username.replace("/", "_")
-    return os.path.join(HISTORY_DIR, f"{safe_user}.json")
 
 def load_user_conversations(username: str) -> List[Dict[str, Any]]:
-    path = history_path(username)
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        # Corrupt file? Start fresh.
-        return []
+    """
+    Return list of conversations for this user:
+    [{ "id": ..., "title": ..., "messages": [...] }, ...]
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, title, messages
+            FROM conversations
+            WHERE username = %s
+            ORDER BY updated_at DESC
+            """,
+            (username,),
+        )
+        rows = cur.fetchall()
 
-def save_user_conversations(username: str, conversations: List[Dict[str, Any]]):
-    path = history_path(username)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(conversations, f, indent=2)
+    conversations: List[Dict[str, Any]] = []
+    for conv_id, title, messages in rows:
+        conversations.append(
+            {
+                "id": conv_id,
+                "title": title,
+                "messages": messages,  # psycopg will give you a Python list/dict from JSONB
+            }
+        )
+    return conversations
+
+
+def save_user_conversations(username: str, conversations: List[Dict[str, Any]]) -> None:
+    """
+    Persist all conversations for this user.
+    Simple strategy: upsert each conversation by ID.
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        for conv in conversations:
+            conv_id = conv["id"]
+            title = conv.get("title", "Conversation")
+            messages = conv.get("messages", [])
+
+            cur.execute(
+                """
+                INSERT INTO conversations (id, username, title, messages)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (id)
+                DO UPDATE SET
+                    title = EXCLUDED.title,
+                    messages = EXCLUDED.messages,
+                    updated_at = NOW()
+                """,
+                (conv_id, username, title, json.dumps(messages)),
+            )
