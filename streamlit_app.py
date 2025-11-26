@@ -39,6 +39,12 @@ def load_logo_base64(path):
 
 logo_data = load_logo_base64("logo/LogoAI2.png")
 
+#------------DB-----------------------------------------------
+from db_init import init_db
+
+# Ensure database schema exists
+init_db()
+
 #------------LLM for Title--------------------------------------
 from openai import OpenAI
 client = OpenAI()
@@ -94,82 +100,53 @@ st.set_page_config(
     page_icon="💬",
     layout="wide",
 )
+
 # ------------------------- Users-------------------------
-import json
+#import json
 import bcrypt
 from history_store import load_user_conversations, save_user_conversations
+from db import get_conn
 
-
-USERS = {}
-
-def _load_users_from_json(path: str = "users.json"):
-
-    global USERS
-
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        USERS = {}
-        return
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            data = []
-    except Exception:
-        # Corrupt or invalid JSON -> act as if no users
-        USERS = {}
-        return
-
-    USERS = {u["username"]: u["password_hash"].encode("utf-8") for u in data}
 
 def verify_user(username: str, password: str) -> bool:
-    """Return True if username/password is valid."""
-    if not USERS:
-        _load_users_from_json()
-    pw_hash = USERS.get(username)
-    if not pw_hash:
+    """Return True if username/password is valid (from Postgres)."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT password_hash FROM app_users WHERE username = %s",
+            (username,),
+        )
+        row = cur.fetchone()
+
+
+    if not row:
         return False
+
+    pw_hash = row[0].encode("utf-8")
     return bcrypt.checkpw(password.encode("utf-8"), pw_hash)
 
-def create_user(username: str, password: str, path: str = "users.json"):
+
+def create_user(username: str, password: str):
     """
-    Creates a NEW user in users.json.
+    Creates a NEW user in Postgres.
     If username already exists -> raise ValueError.
-    Stores BOTH:
-      - password_plain (for internal use)
-      - password_hash (for auth)
     """
-    users_list = []
-
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                users_list = json.load(f)
-            if not isinstance(users_list, list):
-                users_list = []
-        except Exception:
-            # if file is corrupt, start fresh list
-            users_list = []
-
-    # ❗ Check duplicate username
-    for u in users_list:
-        if u.get("username") == username:
-            raise ValueError("Username already exists")
-
     pw_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
-    users_list.append(
-        {
-            "username": username,
-            "password_plain": password,
-            "password_hash": pw_hash,
-        }
-    )
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # Check duplicate
+        cur.execute(
+            "SELECT 1 FROM app_users WHERE username = %s",
+            (username,),
+        )
+        if cur.fetchone():
+            raise ValueError("Username already exists")
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(users_list, f, indent=2)
-
-    _load_users_from_json(path)
+        cur.execute(
+            "INSERT INTO app_users (username, password_hash) VALUES (%s, %s)",
+            (username, pw_hash),
+        )
 
 
 # ------------------------- Login -------------------------
@@ -179,6 +156,7 @@ if "authed" not in st.session_state:
 if "user" not in st.session_state:
     st.session_state.user = None
 
+
 def require_login():
     if st.session_state.authed:
         return
@@ -187,7 +165,7 @@ def require_login():
         f"<img src='{logo_data}' style='width:300px;margin-bottom:25px;'>",
         unsafe_allow_html=True
     )
-    #st.markdown("### 🔒 Please log in")
+    # st.markdown("### 🔒 Please log in")
 
     with st.form("login-form", clear_on_submit=False):
         username = st.text_input("Username")
@@ -203,10 +181,6 @@ def require_login():
         if not username or not password:
             st.error("Please enter both a username and a password.")
             return
-
-        # Make sure USERS is loaded
-        if not USERS:
-            _load_users_from_json()
 
         if mode == "Login":
             # 👉 One generic error for:
@@ -703,5 +677,4 @@ with st.sidebar:
         st.metric("Total cost", f"${float(USAGE_TOTALS.get('total_cost', 0.0)):.4f}")
     except Exception:
         st.info("Usage totals not available.")
-
 
