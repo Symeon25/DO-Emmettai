@@ -367,7 +367,7 @@ with st.sidebar:
     # Simple, stable uploader: NO dynamic key
     uploaded_files = st.file_uploader(
         "Drop your files:",
-        type=[" pdf", "docx", "txt", "pptx", "ppt"],
+        type=["pdf", "docx", "txt", "pptx", "ppt"],
         accept_multiple_files=True,
         key=st.session_state.uploader_key,
     )
@@ -703,4 +703,5 @@ with st.sidebar:
         st.metric("Total cost", f"${float(USAGE_TOTALS.get('total_cost', 0.0)):.4f}")
     except Exception:
         st.info("Usage totals not available.")
+
 
