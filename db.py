@@ -3,7 +3,7 @@ import os
 import psycopg
 from contextlib import contextmanager
 
-DATABASE_URL = os.environ["DATABASE_URL"]  # set this in DO App Platform
+DATABASE_URL = os.environ["DATABASE_URL"].strip()  # 👈 strip spaces
 
 @contextmanager
 def get_conn():
