@@ -97,31 +97,17 @@ def split_docs(docs: List[Document]) -> List[Document]:
 
 
 # ------------- Direct vector-space ingestion ----------------
-
 from typing import Dict, List
-from openai import BadRequestError, APIError  # add this import at the top
-
-# ... keep everything above as-is ...
+from langchain_core.documents import Document
+from openai import BadRequestError, APIError  # or appropriate error class from your client
 
 def add_chunks_to_vectorstore(
     chunks: List[Document],
     collection_name: str | None = None,
 ) -> Dict:
-    """
-    Take a list of already-prepared chunks (Documents) and add them
-    directly to PGVector. No filesystem, no 'data' directory.
-
-    Returns a small summary with embedding token usage & cost.
-
-    This version is more defensive:
-    - ensures page_content is str
-    - skips empty / extremely large chunks
-    - surfaces clearer errors for embedding 400s
-    """
-    # Optional: allow overriding collection name at call-time
     global vectorstore
+
     if collection_name and collection_name != COLLECTION:
-        # Rebuild vectorstore for a different collection if needed
         vectorstore = PGVector(
             embeddings=embeddings,
             collection_name=collection_name,
@@ -137,7 +123,7 @@ def add_chunks_to_vectorstore(
     for i, c in enumerate(chunks):
         md = dict(c.metadata or {})
 
-        # ---- make sure content is a safe string ----
+        # --- normalize content to a safe string ---
         text = c.page_content if c.page_content is not None else ""
         if not isinstance(text, str):
             text = str(text)
@@ -146,27 +132,14 @@ def add_chunks_to_vectorstore(
         if not text.strip():
             continue
 
-        # OPTIONAL: very defensive guard against extreme size
-        # (your chunk_size is 300 tokens, so this normally won't trigger)
-        if len(text) > 20000:  # about 20k characters as a sanity check
-            print(
-                "Skipping very large chunk from",
-                md.get("filename") or md.get("source") or "unknown",
-            )
+        # optional super-defensive guard for huge chunks
+        if len(text) > 20000:
+            print("Skipping very large chunk from", md.get("filename") or md.get("source"))
             continue
 
-        # ---- ensure filename and ids are stable ----
-        filename = md.get("filename")
-        if not filename:
-            src = md.get("source")
-            if src:
-                filename = os.path.basename(src)
-            else:
-                filename = "unknown_file"
-
+        filename = md.get("filename") or os.path.basename(md.get("source") or "") or "unknown_file"
         md["filename"] = filename
 
-        # Make a readable, file-based doc_id
         doc_id = md.get("doc_id", f"{filename}::chunk::{i}")
         md["chunk_id"] = i
         md["doc_id"] = doc_id
@@ -175,7 +148,6 @@ def add_chunks_to_vectorstore(
         metadatas.append(md)
         ids.append(doc_id)
 
-    # If everything was filtered out, just return empty usage
     if not texts:
         return {
             "prompt_tokens": 0,
@@ -192,7 +164,6 @@ def add_chunks_to_vectorstore(
     }
 
     try:
-        # This will call OpenAIEmbeddings internally
         with get_openai_callback() as cb:
             vectorstore.add_texts(texts=texts, metadatas=metadatas, ids=ids)
 
@@ -204,29 +175,21 @@ def add_chunks_to_vectorstore(
         embed_usage["prompt_tokens"] = emb_tokens
         embed_usage["total_cost"] = (emb_tokens / 1_000_000.0) * EMBED_PRICE_PER_1M
 
-        # Optional BM25
         BM25_CORPUS.extend(
-            [
-                Document(page_content=texts[i], metadata=metadatas[i])
-                for i in range(len(texts))
-            ]
+            [Document(page_content=texts[i], metadata=metadatas[i]) for i in range(len(texts))]
         )
 
         return embed_usage
 
     except BadRequestError as e:
-        # This is the typical "HTTP 400" situation at the embedding layer
-        # We raise a clearer message; your Streamlit layer will catch it per-file.
+        # This is your 400 Bad Request
         raise RuntimeError(
             f"Embedding request was rejected (400 Bad Request). "
-            f"This often means the content or embedding model is invalid. "
-            f"Details: {e}"
+            f"Content or model might be invalid. Details: {e}"
         ) from e
 
     except APIError as e:
-        # Other OpenAI API errors (5xx, network, etc.)
         raise RuntimeError(f"OpenAI API error while embedding chunks: {e}") from e
 
     except Exception as e:
-        # Anything unexpected
         raise RuntimeError(f"Unexpected error while adding chunks to vector store: {e}") from e
