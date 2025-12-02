@@ -347,10 +347,14 @@ with st.sidebar:
     )
 
     if uploaded_files and st.button("🔄 Upload documents"):
-        all_docs = []
         changed_files = []
         failed_files = []
         skipped_files = []
+
+        # for usage aggregation across successful files
+        total_chunks = 0
+        total_tokens = 0
+        total_cost = 0.0
 
         try:
             with st.spinner("Indexing documents into the vector store…"):
@@ -362,13 +366,19 @@ with st.sidebar:
 
                     ext = os.path.splitext(f.name)[1].lower()
 
-                    # Save to a temporary file (no fixed data folder)
+                    # Only handle supported extensions (extra safety)
+                    if ext not in [".pdf", ".docx", ".txt", ".pptx", ".ppt"]:
+                        failed_files.append(f.name)
+                        st.warning(f"Unsupported file type for {f.name}.")
+                        continue
+
+                    # Save to a temporary file
                     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
                         tmp.write(f.read())
                         tmp_path = tmp.name
 
                     try:
-                        # Choose loader based on extension
+                        # 1) Load
                         if ext == ".pdf":
                             loader = PyPDFLoader(tmp_path)
                         elif ext == ".docx":
@@ -378,20 +388,48 @@ with st.sidebar:
                         elif ext in [".pptx", ".ppt"]:
                             loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
                         else:
+                            # Should not happen due to check above, but keep it safe
                             failed_files.append(f.name)
                             continue
 
                         docs = loader.load()
+                        if not docs:
+                            failed_files.append(f.name)
+                            st.warning(f"No content found in {f.name}.")
+                            continue
+
                         for d in docs:
                             d.metadata["filename"] = f.name
                             d.metadata["source"] = f.name
 
-                        all_docs.extend(docs)
+                        # 2) Split into chunks
+                        try:
+                            chunks = split_docs(docs)
+                        except Exception as e:
+                            failed_files.append(f.name)
+                            st.warning(f"Failed to split {f.name} into chunks: {e}")
+                            st.exception(e)
+                            continue
+
+                        # 3) Add to vector store
+                        try:
+                            usage = add_chunks_to_vectorstore(chunks)
+                        except Exception as e:
+                            failed_files.append(f.name)
+                            st.warning(f"Failed to index {f.name} into the vector store: {e}")
+                            st.exception(e)
+                            continue
+
+                        # If we got here, this file was successfully embedded
                         changed_files.append(f.name)
+                        total_chunks += len(chunks)
+                        total_tokens += usage.get("total_tokens", 0)
+                        total_cost += float(usage.get("total_cost", 0.0))
 
                     except Exception as e:
+                        # Any unexpected error specific to this file only
                         failed_files.append(f.name)
-                        st.warning(f"Failed to load {f.name}: {e}")
+                        st.warning(f"Failed to process {f.name}: {e}")
                         st.exception(e)
 
                     finally:
@@ -401,40 +439,32 @@ with st.sidebar:
                         except Exception:
                             pass
 
-                # Split into chunks + store in PGVector
-                if all_docs:
-                    try:
-                        chunks = split_docs(all_docs)
-                        usage = add_chunks_to_vectorstore(chunks)
+            # Build final embedding message based only on successful files
+            if changed_files and total_chunks > 0:
+                embedding_msg = (
+                    f"Indexed {total_chunks} chunks from {len(changed_files)} file(s). "
+                    f"(≈ {total_tokens} tokens, cost ≈ ${total_cost:.6f})"
+                )
+                st.session_state.last_file_embedding_info = embedding_msg
+            else:
+                # No successful files this round
+                st.session_state.last_file_embedding_info = ""
 
-                        embedding_msg = (
-                            f"Indexed {len(chunks)} chunks from {len(changed_files)} file(s). "
-                            f"(≈ {usage['total_tokens']} tokens, cost ≈ ${usage['total_cost']:.6f})"
-                        )
-                        # Store message so it survives st.rerun()
-                        st.session_state.last_file_embedding_info = embedding_msg
-
-                        print(
-                            f"Indexed files: {', '.join(changed_files)} | "
-                            f"Embedded {usage['total_tokens']} tokens (cost ≈ ${usage['total_cost']:.6f})"
-                        )
-                    except Exception as e:
-                        st.error("Error while adding documents to the vector store.")
-                        st.exception(e)
-                        # Clear previous info if this run failed
-                        st.session_state.last_file_embedding_info = ""
-
-            # Store messages in session (optional)
+            # Store status in session so it survives rerun
             st.session_state.last_ingest_changed = changed_files
             st.session_state.last_ingest_failed = failed_files
             st.session_state.last_skipped_files = skipped_files
             st.session_state.last_upload_files = changed_files if changed_files else []
+
+            # Force file_uploader to reset
             st.session_state.uploader_key += 1
             st.rerun()
 
         except Exception as e:
+            # Absolute last-resort catch so the whole app doesn't crash
             st.error("Error during ingestion")
             st.exception(e)
+
 
     # --- Persistent messages ---
 
@@ -677,5 +707,4 @@ with st.sidebar:
         st.metric("Total cost", f"${float(USAGE_TOTALS.get('total_cost', 0.0)):.4f}")
     except Exception:
         st.info("Usage totals not available.")
-
 
