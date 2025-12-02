@@ -104,7 +104,7 @@ st.set_page_config(
 # ------------------------- Users-------------------------
 #import json
 import bcrypt
-from history_store_new import load_user_conversations, save_user_conversations
+from history_store import load_user_conversations, save_user_conversations
 from db import get_conn
 
 
@@ -677,4 +677,5 @@ with st.sidebar:
         st.metric("Total cost", f"${float(USAGE_TOTALS.get('total_cost', 0.0)):.4f}")
     except Exception:
         st.info("Usage totals not available.")
+
 
