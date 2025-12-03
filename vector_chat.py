@@ -16,6 +16,8 @@ from langchain_openai import ChatOpenAI
 from langchain_community.callbacks import get_openai_callback
 from langchain_core.tools import tool
 
+from langchain_core.messages import HumanMessage, AIMessage
+
 
 from vector_store import (
     vectorstore,       # PGVector instance
@@ -303,6 +305,30 @@ def reset_history(session_id: str = SESSION_ID):
         except Exception:
             _histories[sid] = InMemoryChatMessageHistory()
 
+def sync_history_from_messages(session_id: str, messages: list[dict]) -> None:
+    """
+    Rebuild LangChain's InMemoryChatMessageHistory for a session_id
+    from a list of {'role': 'user'|'assistant', 'content': str} messages.
+    """
+    hist = get_history(session_id)
+    try:
+        hist.clear()
+    except Exception:
+        # If clear() doesn't exist for some reason, just overwrite
+        _histories[session_id] = InMemoryChatMessageHistory()
+        hist = _histories[session_id]
+
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content", "")
+        if not content:
+            continue
+
+        if role == "user":
+            hist.add_message(HumanMessage(content=content))
+        elif role == "assistant":
+            hist.add_message(AIMessage(content=content))
+        # ignore other roles (system, tool) for now, or handle them if you store them
 
 # ----------------- RAG helper + tool (optional) -----------------
 
@@ -355,6 +381,6 @@ def rag_lookup(question: str) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
-__all__ = ["chat", "USAGE_TOTALS", "SESSION_ID", "reset_history", "rag_lookup", "rag_answer"]
+__all__ = ["chat", "USAGE_TOTALS", "SESSION_ID", "reset_history", "rag_lookup", "rag_answer", "sync_history_from_messages"]
 
 
