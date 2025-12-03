@@ -9,6 +9,7 @@ from vector_chat import (
     USAGE_TOTALS,
     SESSION_ID,
     reset_history,
+    sync_history_from_messages,
 )
 
 from vector_store import (
@@ -632,6 +633,7 @@ with st.sidebar:
             if load_clicked:
                 st.session_state.session_id = conv["id"]
                 st.session_state.messages = conv["messages"].copy()
+                sync_history_from_messages(st.session_state.session_id, st.session_state.messages)
                 st.rerun()
 
             # ---- DELETE LOGIC ----
