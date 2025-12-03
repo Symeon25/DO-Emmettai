@@ -19,8 +19,6 @@ from vector_store import (
         COLLECTION
     )
 
-from file_loaders import pick_loader 
-
 from langchain_community.document_loaders import (
     PyPDFLoader,
     Docx2txtLoader,
@@ -344,11 +342,10 @@ with st.sidebar:
     # Simple, stable uploader: NO dynamic key
     uploaded_files = st.file_uploader(
         "Drop your files:",
-        type=["pdf", "docx", "txt", "pptx", "ppt", "csv", "xlsx", "xls"],
+        type=["pdf", "docx", "txt", "pptx", "ppt"],
         accept_multiple_files=True,
         key=st.session_state.uploader_key,
     )
-
 
     if uploaded_files and st.button("🔄 Upload documents"):
         changed_files = []
@@ -371,7 +368,7 @@ with st.sidebar:
                     ext = os.path.splitext(f.name)[1].lower()
 
                     # Only handle supported extensions (extra safety)
-                    if ext not in [".pdf", ".docx", ".txt", ".pptx", ".ppt", ".xlsx", ".xls"]:
+                    if ext not in [".pdf", ".docx", ".txt", ".pptx", ".ppt"]:
                         failed_files.append(f.name)
                         st.warning(f"Unsupported file type for {f.name}.")
                         continue
@@ -382,7 +379,20 @@ with st.sidebar:
                         tmp_path = tmp.name
 
                     try:
-                        loader = pick_loader(tmp_path)
+                        # 1) Load
+                        if ext == ".pdf":
+                            loader = PyPDFLoader(tmp_path)
+                        elif ext == ".docx":
+                            loader = Docx2txtLoader(tmp_path)
+                        elif ext == ".txt":
+                            loader = TextLoader(tmp_path, autodetect_encoding=True)
+                        elif ext in [".pptx", ".ppt"]:
+                            loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
+                        else:
+                            # Should not happen due to check above, but keep it safe
+                            failed_files.append(f.name)
+                            continue
+
                         docs = loader.load()
                         if not docs:
                             failed_files.append(f.name)
@@ -699,5 +709,4 @@ with st.sidebar:
         st.metric("Total cost", f"${float(USAGE_TOTALS.get('total_cost', 0.0)):.4f}")
     except Exception:
         st.info("Usage totals not available.")
-
 
