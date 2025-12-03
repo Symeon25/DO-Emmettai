@@ -32,12 +32,13 @@ BASE_K = max(TOP_K, 20)           # at least 20 candidates
 FETCH_K = max(TOP_K * 2, 40)      # at least 40 for MMR diversity
 
 # ----------------- Retrievers: Dense + LLM Reranker -----------------
-
+"""
 dense = vectorstore.as_retriever(
     search_type="mmr",
     search_kwargs={"k": BASE_K, "fetch_k": FETCH_K, "lambda_mult": 0.7},
 )
-#dense = vectorstore.as_retriever( search_kwargs={"k": 20} )
+"""
+dense = vectorstore.as_retriever( search_kwargs={"k": 20} )
 
 
 answer_llm = ChatOpenAI(
