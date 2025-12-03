@@ -136,6 +136,16 @@ rewrite_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
+def extract_filenames(docs):
+    names = []
+    for d in docs:
+        md = d.metadata or {}
+        src = md.get("source", "unknown")
+        filename = md.get("filename") or (os.path.basename(src) if src else "unknown")
+        names.append(filename)
+    return list(dict.fromkeys(names))  # dedupe in order
+
+
 def format_docs(docs):
     """
     Format retrieved docs into a text block with [Source: <filename>] headers.
@@ -161,6 +171,7 @@ prompt = ChatPromptTemplate.from_messages(
 
 contextualize_q_chain = rewrite_prompt | rerank_llm | StrOutputParser()
 
+
 """
 answer_prompt = ChatPromptTemplate.from_messages(
     [
@@ -168,33 +179,79 @@ answer_prompt = ChatPromptTemplate.from_messages(
             "system",
             "You write in a very detailed, elegant tone, formatting all answers in Markdown. "
             "You are a helpful assistant. If the user expresses gratitude (e.g., 'thank you' or 'thanks'), "
-            "reply with a polite, friendly response (e.g., 'You're very welcome!'). "
-            "Otherwise, use ONLY the provided context to answer accurately and concisely. "
-            "Retrieve data only from the database and at the end of your answer, always append a tag "
-            "in the format: [File: <filenames>]. "
-            "If the question is not answerable from the database context, try to answer but mention "
-            "it is not from the database, then append [File: None]."
+            "reply with a polite, friendly response. "
+            "Use the retrieved Context for factual information. "
+            "You may also consider the retrieved file names (in the `filenames` field) "
+            "when deciding if information is available. "
+            "Do NOT include filenames in your answer; the system will handle that."
         ),
+        MessagesPlaceholder("chat_history"),
+        ("system", "Retrieved files: {filenames}"),  # <-- invisible to user, visible to LLM
         ("system", "Context:\n{context}"),
         ("human", "{question}"),
     ]
 )
 """
+
+
 answer_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You write in a very detailed, elegant tone, formatting all answers in Markdown. "
-            "You are a helpful assistant. If the user expresses gratitude (e.g., 'thank you' or 'thanks'), "
-            "reply with a polite, friendly response (e.g., 'You're very welcome!'). "
-            "Otherwise, use ONLY the provided context to answer accurately and concisely. "
-            "Retrieve data only from the database and at the end of your answer, always append a tag "
-            "in the format: [File: <filenames>]. "
+            "You are an AI assistant for an energy transition consultancy. "
+            "You help analyze and explain energy-related documents such as feasibility studies, "
+            "technical reports, contracts, policy documents, financial models, and project proposals.\n\n"
+            "Writing style:\n"
+            "- Be clear, structured, and professional.\n"
+            "- Use Markdown with headings, bullet points, and tables where helpful.\n"
+            "- Be concise but thorough: start with a short summary, then add detail.\n\n"
+            "Use of context:\n"
+            "- Treat the provided Context as your primary source of truth.\n"
+            "- Only state detailed facts, figures, or quotes if they appear in the Context.\n"
+            "- You may use general domain knowledge for basic explanations, but do NOT invent "
+            "specific numbers, project details, or claims not supported by the Context.\n"
+            "- If the Context is missing, incomplete, or does not answer the question, say so clearly "
+            "and explain what additional information would be needed.\n\n"
+            "Retrieved files and filenames:\n"
+            "- You may use the retrieved file names (provided as metadata) to infer what type of "
+            "information might be available.\n"
+            "- Apart from the final Sources line described below, never mention or list filenames "
+            "or file paths anywhere else in your answer.\n\n"
+            "Sources:\n"
+            "- At the end of your answer, IF AND ONLY IF your answer actually uses information "
+            "from the document Context, append a final line in the format:\n"
+            "  [Sources: filename1, filename2]\n"
+            "- If your answer does NOT rely on the document Context (for example, simple greetings, "
+            "chit-chat, or very general explanations), DO NOT add a Sources line.\n"
+            "- Never mention filenames anywhere else in the answer.\n\n"
+            "Energy & technical guidance:\n"
+            "- Be careful with units (kW vs kWh, MW vs MWh, tCO2 vs kgCO2, etc.). "
+            "Always state units explicitly when using numbers.\n"
+            "- If you derive numbers (e.g., annual energy from hourly data, CO2 savings from kWh), "
+            "show your calculation steps and assumptions.\n"
+            "- If there are uncertainties or assumptions, explicitly list them.\n\n"
+            "Behavior:\n"
+            "- If the user expresses gratitude (e.g. 'thank you' or 'thanks'), reply with a brief, "
+            "friendly response.\n"
+            "- If a question is ambiguous, briefly state the assumptions you are making.\n"
+            "- If something might be interpreted as legal, financial, or regulatory advice, add a short "
+            "disclaimer that this is an AI-generated analysis and should be checked by a qualified expert."
         ),
-        ("system", "Context:\n{context}"),
+        MessagesPlaceholder("chat_history"),
+
+        # Hidden RAG metadata
+        (
+            "system",
+            "You will receive a list of retrieved filenames as metadata. "
+            "They help you reason about what might be in the documents."
+        ),
+        ("system", "FILENAME_METADATA: {filenames}"),
+
+        ("system", "Context from retrieved documents:\n{context}"),
         ("human", "{question}"),
     ]
 )
+
 
 
 def maybe_rewrite(question, chat_history):
@@ -207,14 +264,29 @@ def maybe_rewrite(question, chat_history):
 #retriever_runnable = RunnableLambda(lambda q: hybrid.invoke(q))
 format_runnable = RunnableLambda(format_docs)
 
+
 rag_chain = (
     RunnablePassthrough()
-    .assign(standalone_question=lambda x: maybe_rewrite(x["question"], x.get("chat_history", [])))
-    .assign(context=(itemgetter("standalone_question") | retriever_runnable | format_runnable))
+    .assign(
+        standalone_question=lambda x: maybe_rewrite(
+            x["question"], x.get("chat_history", [])
+        )
+    )
+    # Retrieve docs
+    .assign(docs=itemgetter("standalone_question") | retriever_runnable)
+    # Extract filenames
+    .assign(filenames=lambda x: extract_filenames(x["docs"]))
+    # Format docs into clean context text
+    .assign(context=itemgetter("docs") | format_runnable)
+    # Pass rewritten question
     .assign(question=itemgetter("standalone_question"))
-    | answer_prompt
-    | answer_llm
-    | StrOutputParser()
+    # LLM answer
+    .assign(
+        answer=answer_prompt
+        | answer_llm
+        | StrOutputParser()
+    )
+    | itemgetter("answer")
 )
 
 # ----------------- Chat history (memory) -----------------
@@ -238,7 +310,7 @@ SESSION_ID = os.getenv("SESSION_ID", "default-session")
 def is_trivial(query: str) -> bool:
     q = (query or "").strip().lower()
     return len(q.split()) <= 2 and q in {
-        "hi", "hey", "hello", "yo", "sup", "good morning", "good evening"
+        "hi", "hey", "hello", "yo", "sup", "good morning", "good evening", "Hallo" 
     }
 
 # ----------------- Usage tracking -----------------
@@ -330,7 +402,8 @@ def sync_history_from_messages(session_id: str, messages: list[dict]) -> None:
             hist.add_message(AIMessage(content=content))
         # ignore other roles (system, tool) for now, or handle them if you store them
 
-# ----------------- RAG helper + tool (optional) -----------------
+# ----------------- RAG helper + tool -----------------
+# Agent tool
 
 def rag_answer(question: str, session_id: str = SESSION_ID, top_k: int = TOP_K):
     """
@@ -340,10 +413,15 @@ def rag_answer(question: str, session_id: str = SESSION_ID, top_k: int = TOP_K):
     chat_history = hist.messages if hist is not None else []
     standalone = maybe_rewrite(question, chat_history)
 
-    docs = dense_with_rerank(standalone,  top_k=top_k)
+    docs = dense_with_rerank(standalone, top_k=top_k)
     context_text = format_docs(docs)
+
     final = (answer_prompt | answer_llm | StrOutputParser()).invoke(
-        {"context": context_text, "question": standalone}
+        {
+            "context": context_text,
+            "question": standalone,
+            "chat_history": chat_history,  # <-- IMPORTANT
+        }
     )
 
     sources = []
@@ -362,13 +440,13 @@ def rag_answer(question: str, session_id: str = SESSION_ID, top_k: int = TOP_K):
 
     confidence = min(1.0, len(docs) / float(top_k or 1))
 
-
     return {
         "answer": final,
         "sources": sources,
         "used_db": True,
         "confidence": confidence,
     }
+
 
 
 @tool("rag_lookup")
