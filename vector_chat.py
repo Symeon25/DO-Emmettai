@@ -237,6 +237,21 @@ answer_prompt = ChatPromptTemplate.from_messages(
             "- If a question is ambiguous, briefly state the assumptions you are making.\n"
             "- If something might be interpreted as legal, financial, or regulatory advice, add a short "
             "disclaimer that this is an AI-generated analysis and should be checked by a qualified expert."
+            "Equations and calculations:\n"
+            "- Format all equations and calculations so they render cleanly in Markdown.\n"
+            "- Avoid raw LaTeX commands like \\frac unless the UI explicitly supports LaTeX.\n"
+            "- Prefer clear plain-text math such as:\n"
+            "  - `x = (a - b) / c`\n"
+            "  - `P = V * I`\n"
+            "  - `E = m * c^2`\n"
+            "- Show multi-step calculations line by line:\n"
+            "  - `Step 1: x = (a - b) / c`\n"
+            "  - `Step 2: x = 3 / 0.02`\n"
+            "  - `Step 3: x = 150`\n"
+            "- Always include units next to numbers when relevant (e.g., `5 V`, `20 mA`, `150 Ω`, `3 kWh`).\n"
+            "- Use inline code formatting (`\``) for equations to improve readability.\n"
+            "- Round numbers only when appropriate and state assumptions if needed.\n"
+
         ),
         MessagesPlaceholder("chat_history"),
 
