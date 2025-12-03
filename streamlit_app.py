@@ -19,6 +19,8 @@ from vector_store import (
         COLLECTION
     )
 
+from file_loaders import pick_loader 
+
 from langchain_community.document_loaders import (
     PyPDFLoader,
     Docx2txtLoader,
@@ -105,7 +107,7 @@ st.set_page_config(
 # ------------------------- Users-------------------------
 #import json
 import bcrypt
-from history_store import load_user_conversations, save_user_conversations
+from history_store_new import load_user_conversations, save_user_conversations
 from db import get_conn
 
 
@@ -342,10 +344,11 @@ with st.sidebar:
     # Simple, stable uploader: NO dynamic key
     uploaded_files = st.file_uploader(
         "Drop your files:",
-        type=["pdf", "docx", "txt", "pptx", "ppt"],
+        type=["pdf", "docx", "txt", "pptx", "ppt", "csv", "xlsx", "xls"],
         accept_multiple_files=True,
         key=st.session_state.uploader_key,
     )
+
 
     if uploaded_files and st.button("🔄 Upload documents"):
         changed_files = []
@@ -368,7 +371,7 @@ with st.sidebar:
                     ext = os.path.splitext(f.name)[1].lower()
 
                     # Only handle supported extensions (extra safety)
-                    if ext not in [".pdf", ".docx", ".txt", ".pptx", ".ppt"]:
+                    if ext not in [".pdf", ".docx", ".txt", ".pptx", ".ppt", ".xlsx", ".xls"]:
                         failed_files.append(f.name)
                         st.warning(f"Unsupported file type for {f.name}.")
                         continue
@@ -379,20 +382,7 @@ with st.sidebar:
                         tmp_path = tmp.name
 
                     try:
-                        # 1) Load
-                        if ext == ".pdf":
-                            loader = PyPDFLoader(tmp_path)
-                        elif ext == ".docx":
-                            loader = Docx2txtLoader(tmp_path)
-                        elif ext == ".txt":
-                            loader = TextLoader(tmp_path, autodetect_encoding=True)
-                        elif ext in [".pptx", ".ppt"]:
-                            loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
-                        else:
-                            # Should not happen due to check above, but keep it safe
-                            failed_files.append(f.name)
-                            continue
-
+                        loader = pick_loader(tmp_path)
                         docs = loader.load()
                         if not docs:
                             failed_files.append(f.name)
