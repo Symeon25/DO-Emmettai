@@ -105,7 +105,7 @@ st.set_page_config(
 # ------------------------- Users-------------------------
 #import json
 import bcrypt
-from history_store import load_user_conversations, save_user_conversations
+from history_store import load_user_conversations, save_user_conversations, delete_conversation
 from db import get_conn
 
 
@@ -638,20 +638,24 @@ with st.sidebar:
 
             # ---- DELETE LOGIC ----
             if delete_clicked:
+                # Delete from DB
+                delete_conversation(user, conv["id"])
+
+                # Delete from session state
                 st.session_state.past_conversations = [
                     c for c in st.session_state.past_conversations
                     if c["id"] != conv["id"]
                 ]
-                save_user_conversations(user, st.session_state.past_conversations)
 
+                # If deleting the active conversation, reset UI
                 if conv["id"] == current_id:
                     st.session_state.messages = []
-                    st.session_state.session_id = (
-                        f"{user}-conv-{st.session_state.conv_counter}"
-                    )
+                    st.session_state.conv_counter += 1
+                    st.session_state.session_id = f"{user}-conv-{st.session_state.conv_counter}"
                     reset_history(st.session_state.session_id)
 
                 st.rerun()
+
 
             # ---- CONTENT INSIDE EXPANDER ----
             with exp:
