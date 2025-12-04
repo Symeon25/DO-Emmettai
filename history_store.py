@@ -58,3 +58,11 @@ def save_user_conversations(username: str, conversations: List[Dict[str, Any]]) 
                 """,
                 (conv_id, username, title, json.dumps(messages)),
             )
+
+def delete_conversation(username: str, conv_id: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM conversations WHERE username = %s AND id = %s",
+            (username, conv_id)
+        )
