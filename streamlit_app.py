@@ -3,6 +3,27 @@ import time
 import traceback
 import streamlit as st
 
+import re
+
+def latex_to_dollars(s: str) -> str:
+    # \[ ... \]  →  $$ ... $$
+    s = re.sub(
+        r'\\\[(.*?)\\\]',
+        lambda m: f'$${m.group(1).strip()}$$',
+        s,
+        flags=re.DOTALL,
+    )
+
+    # \( ... \)  →  $ ... $
+    s = re.sub(
+        r'\\\((.*?)\\\)',
+        lambda m: f'${m.group(1).strip()}$',
+        s,
+        flags=re.DOTALL,
+    )
+
+    return s
+
 # ---- Import your existing backend without altering it ----
 from vector_chat import (
     chat,
@@ -105,7 +126,7 @@ st.set_page_config(
 # ------------------------- Users-------------------------
 #import json
 import bcrypt
-from history_store import load_user_conversations, save_user_conversations, delete_conversation
+from history_store_new import load_user_conversations, save_user_conversations, delete_conversation
 from db import get_conn
 
 
@@ -265,6 +286,7 @@ user_input = st.chat_input("Type your question…")
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
+        user_input=latex_to_dollars(user_input)
         st.markdown(user_input)
 
     with st.chat_message("assistant"):
@@ -276,6 +298,8 @@ if user_input:
                 st.session_state.messages,
                 session_id=st.session_state.session_id, 
             )
+          
+            response_text=latex_to_dollars(response_text)
             elapsed = time.time() - start
 
             placeholder.markdown(response_text, unsafe_allow_html=False)
