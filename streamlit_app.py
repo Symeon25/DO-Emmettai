@@ -25,15 +25,17 @@ def latex_to_dollars(s: str) -> str:
     return s
 
 # ---- Import your existing backend without altering it ----
-from vector_chat import (
-    chat,
-    USAGE_TOTALS,
-    SESSION_ID,
+from Rag_files.rag_core import (
+    SESSION_TOTALS as RAG_SESSION_TOTALS,
     reset_history,
     sync_history_from_messages,
 )
 
-from vector_store import (
+from Agent_file.Agent import agent_chat, SESSION_TOTALS as AGENT_SESSION_TOTALS
+
+
+
+from Rag_files.vector_store import (
         add_chunks_to_vectorstore,
         embeddings,
         split_docs,
@@ -62,7 +64,7 @@ def load_logo_base64(path):
 logo_data = load_logo_base64("logo/LogoAI2.png")
 
 #------------DB-----------------------------------------------
-from db_init import init_db
+from User_files.db_init import init_db
 
 # Ensure database schema exists
 init_db()
@@ -126,8 +128,8 @@ st.set_page_config(
 # ------------------------- Users-------------------------
 #import json
 import bcrypt
-from history_store import load_user_conversations, save_user_conversations, delete_conversation
-from db import get_conn
+from User_files.history_store_new import load_user_conversations, save_user_conversations, delete_conversation
+from User_files.db import get_conn
 
 
 def verify_user(username: str, password: str) -> bool:
@@ -285,6 +287,7 @@ user_input = st.chat_input("Type your question…")
 
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
+    sync_history_from_messages(st.session_state.session_id, st.session_state.messages)
     with st.chat_message("user"):
         user_input=latex_to_dollars(user_input)
         st.markdown(user_input)
@@ -293,7 +296,7 @@ if user_input:
         placeholder = st.empty()
         try:
             start = time.time()
-            response_text = chat(
+            response_text = agent_chat(
                 user_input,
                 st.session_state.messages,
                 session_id=st.session_state.session_id, 
@@ -730,11 +733,27 @@ with st.sidebar:
 
 
     st.subheader("💳 Usage (chat)")
+
     try:
-        st.metric("Prompt tokens", int(USAGE_TOTALS.get("prompt_tokens", 0)))
-        st.metric("Completion tokens", int(USAGE_TOTALS.get("completion_tokens", 0)))
-        st.metric("Total tokens", int(USAGE_TOTALS.get("total_tokens", 0)))
-        st.metric("Total cost", f"${float(USAGE_TOTALS.get('total_cost', 0.0)):.4f}")
+        user_prefix = f"{user}-conv-"
+
+        user_prompt_tokens = 0.0
+        user_completion_tokens = 0.0
+        user_total_tokens = 0.0
+        user_total_cost = 0.0
+
+        # Aggregate over all sessions belonging to this user
+        for sid, stats in RAG_SESSION_TOTALS.items():
+            if isinstance(sid, str) and sid.startswith(user_prefix):
+                user_prompt_tokens     += stats.get("prompt_tokens", 0)
+                user_completion_tokens += stats.get("completion_tokens", 0)
+                user_total_tokens      += stats.get("total_tokens", 0)
+                user_total_cost        += stats.get("total_cost", 0.0)
+
+        st.metric("Prompt tokens", int(user_prompt_tokens))
+        st.metric("Completion tokens", int(user_completion_tokens))
+        st.metric("Total tokens", int(user_total_tokens))
+        st.metric("Total cost", f"${user_total_cost:.4f}")
     except Exception:
         st.info("Usage totals not available.")
 
