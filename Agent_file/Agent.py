@@ -26,7 +26,7 @@ from langchain_community.callbacks import get_openai_callback
 load_dotenv()
 
 # --------- Model ---------
-model_name = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+model_name = os.getenv("OPENAI_MODEL", "gpt-5.2")
 llm = ChatOpenAI(model=model_name, temperature=0)
 
 # --------- Tools---------
@@ -311,4 +311,5 @@ if __name__ == "__main__":
             m.pretty_print()
         except Exception:
             print(type(m), m)
+
 
